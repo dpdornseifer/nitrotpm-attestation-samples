@@ -1,6 +1,4 @@
 #!/bin/bash
-# No `set -x`: secure-boot signing key material is handled in memory and
-# xtrace would echo it to stderr.
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -11,7 +9,6 @@ RESOURCES_FILE="$ARTIFACTS_DIR/resources.json"
 # shellcheck source=lib/identity.sh
 . "$SCRIPT_DIR/lib/identity.sh"
 
-# Parse flags
 SECURE_BOOT_FLAG=""
 DEBUG_FLAG=""
 TIMEOUT=600
@@ -32,12 +29,10 @@ while [[ $# -gt 0 ]]; do
     --skip-sg-update) SKIP_SG_UPDATE=true; shift ;;
     --admin-role-arn) ADMIN_ROLE_ARN_OVERRIDE="$2"; shift; shift ;;
     --vpc-id) VPC_ID_FLAG="--vpc-id $2"; shift; shift ;;
-    # Resume a prior --no-cleanup run (2 = validation, 3 = persistence)
-    --start-phase) START_PHASE="$2"; shift; shift ;;
+    --start-phase) START_PHASE="$2"; shift; shift ;; # resume a prior --no-cleanup run
     --secrets-manager)
       SECRET_MANAGER_FLAG="true"
       shift
-      # Optional identity ARN; without one a fresh identity is generated in Phase 1
       if [[ $# -gt 0 ]] && [[ "$1" != --* ]]; then
         IDENTITY_ARN="$1"; shift
         validate_secret_arn "$IDENTITY_ARN"
@@ -57,18 +52,15 @@ case "$START_PHASE" in
   *) echo "Error: --start-phase must be 1, 2, or 3 (got '$START_PHASE')"; exit 1 ;;
 esac
 
-# Track phase results
 PHASE1_RESULT="SKIP"
 PHASE2_RESULT="SKIP"
 PHASE3_RESULT="SKIP"
 PHASE4_RESULT="SKIP"
 
-# Temp files for mTLS client certificates
 CLIENT_CA_FILE=""
 CLIENT_CERT_FILE=""
 CLIENT_KEY_FILE=""
 
-# Fresh run: empty resources.json. Resume: reuse the recorded resources.
 mkdir -p "$ARTIFACTS_DIR"
 if [ "$START_PHASE" -eq 1 ]; then
   echo '{}' > "$RESOURCES_FILE"
@@ -77,8 +69,6 @@ elif [ ! -f "$RESOURCES_FILE" ]; then
   exit 1
 fi
 
-# Load recorded resource IDs and re-derive the instance IPs (never persisted)
-# so Phase 2/3 can resume without re-provisioning.
 load_provisioned_state() {
   AMI_ID=$(jq -r '.AMI_ID // empty' "$RESOURCES_FILE")
   ROLE_NAME=$(jq -r '.ROLE_NAME // empty' "$RESOURCES_FILE")
@@ -100,10 +90,8 @@ load_provisioned_state() {
   [ "$SKIP_SG_UPDATE" = false ] && print_sg_authorization_notice "$SG_ID"
 }
 
-# Helper: retrieve client certificates from Secrets Manager
 retrieve_client_certs() {
-  # Suppress xtrace so the client private key can't be echoed to stderr;
-  # the RETURN trap restores the caller's xtrace state.
+  # Suppress xtrace so the client private key isn't echoed; RETURN trap restores it.
   case "$-" in *x*) trap 'set -x; trap - RETURN' RETURN; set +x ;; esac
 
   echo "Retrieving client certificate bundle from Secrets Manager..."
@@ -142,7 +130,6 @@ retrieve_client_certs() {
   echo "Client certificates written to temp files."
 }
 
-# Helper: wait for SSM connectivity (used in debug mode only)
 wait_for_ssm() {
   local INSTANCE_ID=$1
   local TIMEOUT=$2
@@ -168,11 +155,9 @@ wait_for_ssm() {
   done
 }
 
-# Helper: run command via SSM (used in debug mode only)
 run_ssm_command() {
   local INSTANCE_ID=$1
   local COMMAND=$2
-  # Build JSON with jq to handle all quoting/escaping correctly
   local TMPJSON
   TMPJSON=$(mktemp)
   jq -n --arg id "$INSTANCE_ID" --arg cmd "$COMMAND" \
@@ -183,7 +168,6 @@ run_ssm_command() {
     --output text)
   rm -f "$TMPJSON"
 
-  # Wait for command to complete
   aws ssm wait command-executed \
     --command-id "$CMD_ID" \
     --instance-id "$INSTANCE_ID" 2>/dev/null || true
@@ -195,7 +179,6 @@ run_ssm_command() {
     --output text
 }
 
-# Helper: wait for PostgreSQL via SSM (used in debug mode only)
 wait_for_postgresql_ssm() {
   local INSTANCE_ID=$1
   local TIMEOUT=$2
@@ -218,14 +201,12 @@ wait_for_postgresql_ssm() {
   done
 }
 
-# Helper: run SQL via SSM (used in debug mode only)
 run_sql_ssm() {
   local INSTANCE_ID=$1
   local SQL=$2
   run_ssm_command "$INSTANCE_ID" "sudo -u postgres psql -c \"$SQL\" -t -A"
 }
 
-# Helper: wait for PostgreSQL via mTLS
 wait_for_postgresql_mtls() {
   local HOST=$1
   local TIMEOUT=$2
@@ -246,19 +227,16 @@ wait_for_postgresql_mtls() {
   done
 }
 
-# Helper: run SQL via psql with mTLS params
 run_sql_mtls() {
   local HOST=$1
   local SQL=$2
   psql "sslmode=verify-ca sslcert=$CLIENT_CERT_FILE sslkey=$CLIENT_KEY_FILE sslrootcert=$CLIENT_CA_FILE host=$HOST port=5432 dbname=postgres user=postgres-client" -c "$SQL" -t -A
 }
 
-# Cleanup function
 cleanup() {
   echo ""
   echo "=== Phase 4: Cleanup ==="
 
-  # Clean up mTLS-specific resources (non-critical)
   local SECRET_ARN
   SECRET_ARN=$(jq -r '.SECRET_ARN // empty' "$RESOURCES_FILE" 2>/dev/null || true)
   local ROLE_NAME
@@ -278,7 +256,6 @@ cleanup() {
     fi
   fi
 
-  # Clean up temp cert files
   if [ -n "$CLIENT_CA_FILE" ] && [ -f "$CLIENT_CA_FILE" ]; then
     rm -f "$CLIENT_CA_FILE"
   fi
@@ -289,7 +266,6 @@ cleanup() {
     rm -f "$CLIENT_KEY_FILE"
   fi
 
-  # Run the main cleanup script for remaining resources
   if [ -f "$RESOURCES_FILE" ]; then
     "$SCRIPT_DIR/clean.sh" && PHASE4_RESULT="PASS" || PHASE4_RESULT="FAIL"
   else
@@ -298,7 +274,6 @@ cleanup() {
   fi
 }
 
-# Validate AWS credentials
 echo "Validating AWS credentials..."
 if ! aws sts get-caller-identity >/dev/null 2>&1; then
   echo "ERROR: AWS credentials are invalid or expired."
@@ -306,14 +281,17 @@ if ! aws sts get-caller-identity >/dev/null 2>&1; then
 fi
 echo "AWS credentials are valid."
 
-# ============================================================
-# Phase 1: Provision
-# ============================================================
 phase1() {
-  # Step 1: Create AMI. Two secure-boot paths:
-  #   --secrets-manager -> reproducible PCR7 from a persisted golden identity
-  #   --secure-boot only -> ephemeral local keys (PCR7 changes each run)
-  echo "Step 1: Creating AMI..."
+  # KMS key first: ARN is pinned into the image (PCR4). Bootstrap policy here; gated in Step 4.
+  echo "Step 1: Creating KMS key (bootstrap policy)..."
+  ADMIN_ROLE_ARN="${ADMIN_ROLE_ARN_OVERRIDE:-$(aws sts get-caller-identity --query 'Arn' --output text)}"
+  OUTPUT=$("$SCRIPT_DIR/steps/02a_create_kms_key.sh" -a "$ADMIN_ROLE_ARN")
+  KMS_KEY_ARN=$(echo "$OUTPUT" | grep -oP 'KMS key created with ARN: \K.*')
+  [ -z "$KMS_KEY_ARN" ] && { echo "Failed to extract KMS key ARN"; return 1; }
+  update_resource "KMS_KEY_ARN" "$KMS_KEY_ARN"
+  echo "KMS Key ARN: $KMS_KEY_ARN"
+
+  echo "Step 2: Creating AMI..."
   CREATE_AMI_ARGS="$SECURE_BOOT_FLAG $DEBUG_FLAG"
   if [ -n "$SECRET_MANAGER_FLAG" ]; then
     if [ -z "$IDENTITY_ARN" ]; then
@@ -334,7 +312,6 @@ phase1() {
   fi
   OUTPUT=$("$SCRIPT_DIR/steps/00_create_ami.sh" $CREATE_AMI_ARGS)
   CREATE_AMI_RC=$?
-  # Scrub local key material regardless of build outcome
   if [ -n "$SECURE_BOOT_FLAG" ] && [ -d "$PROJECT_DIR/sb-keys" ]; then
     rm -rf "$PROJECT_DIR/sb-keys"
   fi
@@ -344,8 +321,7 @@ phase1() {
   update_resource "AMI_ID" "$AMI_ID"
   echo "AMI ID: $AMI_ID"
 
-  # Step 2: Create instance profile
-  echo "Step 2: Setting up IAM..."
+  echo "Step 3: Setting up IAM..."
   ROLE_NAME="TpmAttestationRole"
   INSTANCE_PROFILE_NAME="TpmAttestationProfile"
   if [ -n "$DEBUG_FLAG" ]; then
@@ -356,35 +332,28 @@ phase1() {
   update_resource "ROLE_NAME" "$ROLE_NAME"
   update_resource "INSTANCE_PROFILE_NAME" "$INSTANCE_PROFILE_NAME"
 
-  # Step 3: Create KMS key
-  echo "Step 3: Creating KMS key..."
-  INSTANCE_ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
-  ADMIN_ROLE_ARN="${ADMIN_ROLE_ARN_OVERRIDE:-$(aws sts get-caller-identity --query 'Arn' --output text)}"
-  # Signed image's tpm_pcr.json (PCR4+PCR7) when secure boot is active, else the unsigned baseline
-  PCR_DIR=$(resolve_pcr_dir "$SCRIPT_DIR/.." "$SECURE_BOOT_FLAG")
-  OUTPUT=$("$SCRIPT_DIR/steps/02_create_kms_key.sh" -r "$INSTANCE_ROLE_ARN" -a "$ADMIN_ROLE_ARN" -m "$PCR_DIR")
-  KMS_KEY_ID=$(echo "$OUTPUT" | grep -oP 'KMS key created with ID: \K.*')
-  [ -z "$KMS_KEY_ID" ] && { echo "Failed to extract KMS key ID"; return 1; }
-  update_resource "KMS_KEY_ID" "$KMS_KEY_ID"
-  echo "KMS Key ID: $KMS_KEY_ID"
-
-  # Step 4: Create symmetric key
+  # Wrap the DEK while the bootstrap policy still grants Encrypt, BEFORE finalize strips it.
   echo "Step 4: Creating symmetric key..."
   local KEY_TMPDIR
   KEY_TMPDIR=$(mktemp -d)
   chmod 700 "$KEY_TMPDIR"
   local KEY_FILE="$KEY_TMPDIR/symmetric_key"
-  "$SCRIPT_DIR/steps/03_create_symmetric_key.sh" -k "$KMS_KEY_ID" --plaintext-key-out "$KEY_FILE" \
+  "$SCRIPT_DIR/steps/03_create_symmetric_key.sh" -k "$KMS_KEY_ARN" --plaintext-key-out "$KEY_FILE" \
     || { rm -rf "$KEY_TMPDIR"; return 1; }
 
-  # Step 4a: Generate certificates and store client bundle in Secrets Manager
-  echo "Step 4a: Creating certificates..."
+  # Real policy: Decrypt gated on PCRs; kms:PutKeyPolicy and kms:Encrypt revoked, key immutable from here.
+  echo "Step 5: Finalizing KMS key policy with PCR conditions..."
+  INSTANCE_ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
+  PCR_DIR=$(resolve_pcr_dir "$SCRIPT_DIR/.." "$SECURE_BOOT_FLAG")
+  "$SCRIPT_DIR/steps/02b_finalize_kms_policy.sh" -k "$KMS_KEY_ARN" -r "$INSTANCE_ROLE_ARN" -a "$ADMIN_ROLE_ARN" -m "$PCR_DIR" \
+    || { rm -rf "$KEY_TMPDIR"; echo "Failed to finalize KMS key policy"; return 1; }
+
+  echo "Step 6: Creating certificates..."
   "$SCRIPT_DIR/steps/05a_create_certificates.sh" -r "$ROLE_NAME" --symmetric-key "$KEY_FILE" \
     || { rm -rf "$KEY_TMPDIR"; return 1; }
   rm -rf "$KEY_TMPDIR"
 
-  # Step 5: Create EBS volume
-  echo "Step 5: Creating EBS volume..."
+  echo "Step 7: Creating EBS volume..."
   AVAILABILITY_ZONE=$(aws ec2 describe-availability-zones --query 'AvailabilityZones[0].ZoneName' --output text)
   OUTPUT=$("$SCRIPT_DIR/steps/04_create_ebs_volume.sh" -z "$AVAILABILITY_ZONE")
   VOLUME_ID=$(echo "$OUTPUT" | grep -oP 'Volume ID: \K.*')
@@ -392,8 +361,7 @@ phase1() {
   update_resource "VOLUME_ID" "$VOLUME_ID"
   echo "Volume ID: $VOLUME_ID"
 
-  # Step 6: Launch instance (public IP so out-of-VPC hosts can reach mTLS)
-  echo "Step 6: Launching instance..."
+  echo "Step 8: Launching instance..."
   OUTPUT=$("$SCRIPT_DIR/steps/05_run_instance.sh" -a "$AMI_ID" -p "$INSTANCE_PROFILE_NAME" -v "$VOLUME_ID" $VPC_ID_FLAG --public $DEBUG_FLAG)
   INSTANCE_ID=$(echo "$OUTPUT" | grep -oP 'Instance ID: \K.*')
   PRIVATE_IP=$(echo "$OUTPUT" | grep -oP 'Private IP: \K.*')
@@ -431,26 +399,17 @@ if [ "$START_PHASE" -le 1 ]; then
     exit 1
   fi
 else
-  # Resuming: load provisioned state instead of running Phase 1.
   if ! load_provisioned_state; then
     exit 1
   fi
 fi
 
-# ============================================================
-# Phase 2: First Boot Validation
-# ============================================================
 phase2() {
-  # When interactive and SG update is not skipped, pause so the user can
-  # allowlist their host; in CI (no TTY) or with --skip-sg-update, proceed.
   if [ "$SKIP_SG_UPDATE" = false ] && [ -t 0 ]; then
     read -r -p "Add your host to SG $SG_ID:5432 (see above), then press Enter to validate... " _
   fi
 
-  # Retrieve client certificates for mTLS
   retrieve_client_certs || return 1
-
-  # mTLS path (primary)
   wait_for_postgresql_mtls "$PUBLIC_IP" "$TIMEOUT" || return 1
 
   # Verify SELECT 1 via mTLS
@@ -459,18 +418,15 @@ phase2() {
   [ "$(echo "$RESULT" | tr -d '[:space:]')" = "1" ] || { echo "SELECT 1 failed (mTLS): got '$RESULT'"; return 1; }
   echo "SELECT 1 (mTLS): OK"
 
-  # Write test data via mTLS
   echo "Writing test data (mTLS)..."
   run_sql_mtls "$PUBLIC_IP" "CREATE TABLE IF NOT EXISTS e2e_test (id serial PRIMARY KEY, value text);"
   run_sql_mtls "$PUBLIC_IP" "INSERT INTO e2e_test (value) VALUES ('persistence-check');"
 
-  # Read back test data via mTLS
   echo "Reading back test data (mTLS)..."
   RESULT=$(run_sql_mtls "$PUBLIC_IP" "SELECT value FROM e2e_test WHERE value='persistence-check';")
   [ "$RESULT" = "persistence-check" ] || { echo "Read back failed (mTLS): got '$RESULT'"; return 1; }
   echo "Test data verified (mTLS): OK"
 
-  # SSM path (supplementary, only when --debug is passed)
   if [ -n "$DEBUG_FLAG" ]; then
     echo "Debug mode: running SSM-based checks..."
     wait_for_ssm "$INSTANCE_ID" "$TIMEOUT" || return 1
@@ -514,29 +470,22 @@ if [ "$START_PHASE" -le 2 ]; then
   fi
 fi
 
-# ============================================================
-# Phase 3: Persistence Validation
-# ============================================================
 echo ""
 echo "=== Phase 3: Persistence Validation ==="
 
 phase3() {
-  # Certs may not have been fetched yet when resuming with --start-phase 3
   if [ -z "$CLIENT_CA_FILE" ] || [ ! -f "$CLIENT_CA_FILE" ]; then
     retrieve_client_certs || return 1
   fi
 
-  # Terminate first instance (preserve EBS volume)
   echo "Terminating first instance $INSTANCE_ID..."
   aws ec2 terminate-instances --instance-ids "$INSTANCE_ID"
   aws ec2 wait instance-terminated --instance-ids "$INSTANCE_ID"
   echo "First instance terminated."
 
-  # Wait for volume to become available after detach
   echo "Waiting for EBS volume to become available..."
   aws ec2 wait volume-available --volume-ids "$VOLUME_ID"
 
-  # Second instance reuses the same volume and SG (the 5432 allowlist rule still applies)
   echo "Launching second instance..."
   OUTPUT=$("$SCRIPT_DIR/steps/05_run_instance.sh" -a "$AMI_ID" -p "$INSTANCE_PROFILE_NAME" -v "$VOLUME_ID" $VPC_ID_FLAG --public $DEBUG_FLAG)
   INSTANCE_ID=$(echo "$OUTPUT" | grep -oP 'Instance ID: \K.*')
@@ -545,11 +494,9 @@ phase3() {
   SG_ID2=$(echo "$OUTPUT" | grep -oP 'Security Group ID: \K.*')
   [ -z "$INSTANCE_ID" ] || [ -z "$PUBLIC_IP" ] && { echo "Failed to launch second instance"; return 1; }
   update_resource "INSTANCE_ID" "$INSTANCE_ID"
-  # Keep original SG_ID for cleanup (or update if new one created)
   [ -n "$SG_ID2" ] && update_resource "SECURITY_GROUP_ID" "$SG_ID2"
   echo "Second instance: $INSTANCE_ID, Private IP: $PRIVATE_IP, Public IP: $PUBLIC_IP"
 
-  # mTLS path (primary)
   wait_for_postgresql_mtls "$PUBLIC_IP" "$TIMEOUT" || return 1
 
   # Verify persisted data via mTLS
@@ -558,7 +505,6 @@ phase3() {
   [ "$RESULT" = "persistence-check" ] || { echo "Persistence check failed (mTLS): got '$RESULT'"; return 1; }
   echo "Persistence verified (mTLS): OK"
 
-  # SSM path (supplementary, only when --debug is passed)
   if [ -n "$DEBUG_FLAG" ]; then
     echo "Debug mode: running SSM-based persistence checks..."
     wait_for_ssm "$INSTANCE_ID" "$TIMEOUT" || return 1
@@ -579,9 +525,6 @@ else
   echo "Phase 3: FAIL"
 fi
 
-# ============================================================
-# Phase 4: Cleanup (always runs unless --no-cleanup)
-# ============================================================
 if [ "$NO_CLEANUP" = true ]; then
   echo ""
   echo "=== Phase 4: Cleanup ==="
@@ -593,9 +536,6 @@ else
   cleanup
 fi
 
-# ============================================================
-# Summary
-# ============================================================
 echo ""
 echo "=== E2E Test Summary ==="
 echo "Phase 1 (Provision):              $PHASE1_RESULT"
@@ -603,7 +543,6 @@ echo "Phase 2 (First Boot Validation):  $PHASE2_RESULT"
 echo "Phase 3 (Persistence Validation): $PHASE3_RESULT"
 echo "Phase 4 (Cleanup):                $PHASE4_RESULT"
 
-# Fail only on FAIL; SKIP is not a failure
 for RESULT in "$PHASE1_RESULT" "$PHASE2_RESULT" "$PHASE3_RESULT" "$PHASE4_RESULT"; do
   if [ "$RESULT" = "FAIL" ]; then
     exit 1

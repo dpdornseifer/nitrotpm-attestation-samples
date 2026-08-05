@@ -10,7 +10,26 @@
       (system:
         let
           pkgs = nixpkgs.legacyPackages."${system}";
-          kmsInitScript = pkgs.callPackage ./kms-init.nix { inherit nitro-tee; };
+          lib = nixpkgs.lib;
+
+          # Pinned at build time into the measured store closure: a different key requires a rebuild (changes PCR4, rejected by the policy).
+          # git-tracked on purpose — git+file:// flake refs only see tracked paths; empty = buildable but boots fail-closed.
+          kmsKeyArn =
+            if !builtins.pathExists ./kms-key-arn.txt then
+              throw ("kms-key-arn.txt is missing from the flake source. It must be git-tracked: "
+                + "a git+file:// flake ref only sees tracked paths. "
+                + "Run: git add nix/examples/postgres-kms/kms-key-arn.txt")
+            else
+              let
+                raw = lib.removeSuffix "\n" (builtins.readFile ./kms-key-arn.txt);
+                pattern = "arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[0-9a-f-]{36}";
+              in
+              if raw == "" || builtins.match pattern raw != null then raw
+              else
+                throw ("kms-key-arn.txt must hold one full KMS key ARN with no surrounding "
+                  + "whitespace, or be empty to build unpinned. Got: '" + raw + "'");
+
+          kmsInitScript = pkgs.callPackage ./kms-init.nix { inherit nitro-tee kmsKeyArn; };
           luksInitScript = pkgs.callPackage ./luks-init.nix { };
           certInitScript = pkgs.callPackage ./cert-init.nix { };
           imdsCredentialsScript = pkgs.callPackage ./imds-credentials.nix { };
@@ -25,7 +44,6 @@
               extraGroups = [ "tpm" ];
             };
 
-            # postgres needs no kms-init group access: cert-init chowns the cert files to it.
 
             system.stateVersion = "24.11";
 
@@ -82,20 +100,9 @@
               };
             };
 
-            # dm-integrity backs the authenticated-encryption layer that luks-init
-            # formats the data volume with.
             boot.kernelModules = [ "dm-integrity" ];
 
-            # /dev/mapper/data only appears once luksFormat's integrity-tag wipe
-            # finishes, which is ~90s on a 10 GiB volume and scales with size.
-            # data.mount gets an implicit Requires= on this device from What=, and a
-            # device unit's JobRunningTimeoutSec defaults to DefaultDeviceTimeoutSec
-            # (90s). systemd.unit(5) documents that job timeout as independent of the
-            # TimeoutStartSec set on luks-unlock, so first boot raced it: the device
-            # job timed out, data.mount's job was discarded, and nothing re-queued it
-            # when luks-unlock succeeded seconds later. Scoped to this one device
-            # rather than raising DefaultDeviceTimeoutSec globally, which would make
-            # any genuinely absent device stall boot for the same duration.
+            # First-boot integrity-tag wipe (~90s/10 GiB) outlasts the 90s default device job timeout, discarding data.mount before luks-unlock finishes; scoped to this device only.
             systemd.units."dev-mapper-data.device" = {
               overrideStrategy = "asDropin";
               text = ''
@@ -113,13 +120,8 @@
                 Type = "oneshot";
                 ExecStart = luksInitScript;
                 RemainAfterExit = true;
-                # luks-init.sh waits in-process (up to 120s) for the hot-attached
-                # EBS device. On first boot it then formats with --integrity,
-                # which wipes the authentication tags across the whole device
-                # before mkfs — a full-device write, so this needs far more than
-                # the 180s that sufficed for length-preserving encryption.
+                # First-boot --integrity wipe is a full-device write; 1800s covers large volumes.
                 TimeoutStartSec = "1800s";
-                # Runs as root (needs block device access)
                 ProtectKernelTunables = true;
                 ProtectControlGroups = true;
                 ProtectKernelLogs = true;
@@ -134,14 +136,10 @@
               wantedBy = [ "multi-user.target" ];
               requires = [ "luks-unlock.service" ];
               after = [ "luks-unlock.service" ];
-              # The volume is operator-attachable, so treat its contents as
-              # untrusted: nothing on it should ever be executable or setuid.
-              # PostgreSQL runs nothing out of $PGDATA — extensions load from
-              # $libdir in the read-only store — so noexec is safe here.
+              # Operator-attachable volume; noexec/nosuid safe because PostgreSQL extensions load from the read-only store, not $PGDATA.
               options = "defaults,nodev,nosuid,noexec";
               unitConfig = {
-                # Keep out of local-fs.target to avoid a dependency cycle:
-                # data.mount → luks-unlock → kms-init → basic.target → local-fs.target → data.mount
+                # Avoid cycle: data.mount → luks-unlock → kms-init → basic.target → local-fs.target → data.mount
                 DefaultDependencies = false;
               };
             }];
@@ -178,7 +176,6 @@
               };
             };
 
-            # systemd's mount namespacing requires the data directory to exist before postgresql starts
             systemd.services.postgresql-datadir-init = {
               description = "Create PostgreSQL data directory on encrypted volume";
               wantedBy = [ "multi-user.target" ];
@@ -193,11 +190,9 @@
               };
             };
 
-            # PostgreSQL configuration on the encrypted volume
             services.postgresql = {
               enable = true;
               dataDir = "/data/postgresql";
-              # Create the postgres-client role so mTLS clients with CN=postgres-client can authenticate
               initialScript = pkgs.writeText "init-postgres-client.sql" ''
                 CREATE ROLE "postgres-client" WITH LOGIN;
                 GRANT ALL ON SCHEMA public TO "postgres-client";
@@ -210,29 +205,23 @@
                 listen_addresses = lib.mkForce "*";
               };
               authentication = lib.mkForce ''
-                # Local unix socket connections (peer auth)
                 local all all peer
-                # Remote SSL connections requiring client cert
                 hostssl all all 0.0.0.0/0 cert clientcert=verify-full
                 hostssl all all ::/0 cert clientcert=verify-full
               '';
             };
 
-            # Ensure postgresql starts after the data volume is mounted, dir is created, and certs are ready
             systemd.services.postgresql = {
               requires = [ "data.mount" "postgresql-datadir-init.service" "cert-init.service" ];
               after = [ "data.mount" "postgresql-datadir-init.service" "cert-init.service" ];
               serviceConfig = {
-                # Allow PostgreSQL to read the certificate files under ProtectSystem=strict
                 ReadOnlyPaths = [ "/run/postgresql-certs" ];
               };
             };
 
-            # Firewall and IMDS access control
             networking.firewall = {
-              # Allow inbound PostgreSQL connections over mTLS
               allowedTCPPorts = [ 5432 ];
-              # IMDS access control - only the kms-init user can reach IMDS
+              # Only kms-init may reach IMDS; all other users are dropped.
               extraCommands = "
                 ${pkgs.iptables}/bin/iptables -A OUTPUT -d 169.254.169.254 -m owner --uid-owner kms-init -j ACCEPT
                 ${pkgs.iptables}/bin/iptables -A OUTPUT -d 169.254.169.254 -j DROP
@@ -240,7 +229,6 @@
             };
           };
 
-          # Debug-only configuration: adds IMDS credential helper and SSM agent
           debugUserConfig = { config, pkgs, lib, ... }: {
             environment.systemPackages = [
               (pkgs.runCommand "imds-credentials" {} ''
@@ -249,10 +237,9 @@
               '')
             ];
 
-            # Enable SSM agent for remote shell access (replaces SSH).
             services.amazon-ssm-agent.enable = true;
 
-            # SSM agent runs as root and needs IMDS; insert the ACCEPT before the DROP (debug only)
+            # SSM runs as root and needs IMDS; insert ACCEPT before the production DROP.
             networking.firewall.extraCommands = lib.mkAfter "
               ${pkgs.iptables}/bin/iptables -I OUTPUT -d 169.254.169.254 -m owner --uid-owner root -j ACCEPT
             ";
@@ -260,7 +247,7 @@
         in
         {
           packages = {
-            # Production build (default); secure boot signing is a post-build step (see sign-efi-image)
+            # Secure boot signing is a post-build step (see sign-efi-image).
             raw-image = nitro-tee.lib.${system}.tee-image {
               userConfig = commonUserConfig;
               isDebug = false;
@@ -273,7 +260,6 @@
             };
           };
 
-          # Expose the apps from nitro-tee
           apps = {
             boot-uefi-qemu = nitro-tee.apps.${system}.boot-uefi-qemu;
             create-ami = nitro-tee.apps.${system}.create-ami;

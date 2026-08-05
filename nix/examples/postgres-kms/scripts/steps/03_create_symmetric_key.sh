@@ -2,60 +2,65 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 -k KMS_KEY_ID [--plaintext-key-out FILE]"
-  echo "  -k, --kms-key-id        Specify the KMS Key ID"
+  echo "Usage: $0 -k KMS_KEY_ARN [--plaintext-key-out FILE]"
+  echo "  -k, --kms-key-arn       Full ARN of the KMS key (not a bare key id)"
   echo "  --plaintext-key-out     Write plaintext key to FILE (mode 0600)"
   exit 1
 }
 
+KMS_KEY_ARN=""
 PLAINTEXT_KEY_OUT=""
 
 while [[ "$#" -gt 0 ]]; do
   case $1 in
-    -k|--kms-key-id) KMS_KEY_ID="$2"; shift ;;
+    -k|--kms-key-arn) KMS_KEY_ARN="$2"; shift ;;
     --plaintext-key-out) PLAINTEXT_KEY_OUT="$2"; shift ;;
     *) usage ;;
   esac
   shift
 done
 
-if [ -z "$KMS_KEY_ID" ]; then
-  echo "Error: KMS Key ID is required."
+if [ -z "$KMS_KEY_ARN" ]; then
+  echo "Error: KMS key ARN is required."
   usage
 fi
 
-# Create artifacts directory if it doesn't exist
+# Must be the full ARN: kms-init matches it against the ARN pinned into the image
+# by exact string equality, so a bare key id would pass here and fail every boot.
+if [[ "$KMS_KEY_ARN" != arn:aws*:kms:*:key/* ]]; then
+  echo "Error: '$KMS_KEY_ARN' is not a full KMS key ARN." >&2
+  echo "       Expected arn:aws:kms:<region>:<account>:key/<uuid> — the instance" >&2
+  echo "       compares this against the ARN pinned into the image." >&2
+  exit 1
+fi
+
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 ARTIFACTS_DIR="$SCRIPT_DIR/../../artifacts"
 mkdir -p "$ARTIFACTS_DIR"
 
-# Generate a symmetric key into a private temp file
 KEY_TMPFILE=$(mktemp)
 trap 'rm -f "$KEY_TMPFILE"' EXIT
 (umask 077; openssl rand -base64 32 > "$KEY_TMPFILE")
 echo "Symmetric key generated."
 
-# Encrypt the symmetric key using KMS
 aws kms encrypt \
-  --key-id "$KMS_KEY_ID" \
+  --key-id "$KMS_KEY_ARN" \
   --plaintext fileb://"$KEY_TMPFILE" \
   --output text \
   --query CiphertextBlob | base64 --decode > "$ARTIFACTS_DIR/encrypted_key.bin"
 echo "Symmetric key encrypted with KMS."
 
-# Encode the encrypted key as base64
 ENCRYPTED_KEY=$(base64 -w 0 "$ARTIFACTS_DIR/encrypted_key.bin")
 
-# Create the user data JSON
+# key_id carries the full ARN — instance checks it against the ARN pinned in the image.
 cat << EOF > "$ARTIFACTS_DIR/user_data.json"
 {
-  "key_id": "${KMS_KEY_ID}",
+  "key_id": "${KMS_KEY_ARN}",
   "ciphertext": "${ENCRYPTED_KEY}"
 }
 EOF
 echo "User data JSON created in $ARTIFACTS_DIR/user_data.json"
 
-# If the caller requested the plaintext key, copy it out with restricted perms
 if [ -n "$PLAINTEXT_KEY_OUT" ]; then
   install -m 0600 "$KEY_TMPFILE" "$PLAINTEXT_KEY_OUT"
 fi

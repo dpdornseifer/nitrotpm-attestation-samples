@@ -1,7 +1,5 @@
 #!/bin/bash
-
-# No `set -x`: secure-boot signing key material is handled in memory and
-# xtrace would echo it to stderr.
+# No `set -x`: xtrace would echo secure-boot key material to stderr.
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
@@ -36,7 +34,6 @@ while [[ $# -gt 0 ]]; do
     --secrets-manager)
       SECRET_MANAGER_FLAG="true"
       shift
-      # Check if next argument is absent or starts with '--'
       if [[ $# -eq 0 ]] || [[ "$1" == --* ]]; then
         SECRET_MANAGER_INTERACTIVE="true"
       else
@@ -52,7 +49,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Validate that --secrets-manager requires --secure-boot
 if [ -n "$SECRET_MANAGER_FLAG" ] && [ -z "$SECURE_BOOT_FLAG" ]; then
   echo "Error: --secrets-manager requires --secure-boot"
   exit 1
@@ -62,13 +58,10 @@ ARTIFACTS_DIR="$SCRIPT_DIR/../artifacts"
 RESOURCES_FILE="$ARTIFACTS_DIR/resources.json"
 
 mkdir -p "$ARTIFACTS_DIR"
-# Keep an existing resources file: it may hold a reusable IDENTITY_ARN
 if [ ! -f "$RESOURCES_FILE" ]; then
   echo '{}' > "$RESOURCES_FILE"
 fi
 
-# Generate a fresh golden identity and upload it to Secrets Manager.
-# Regenerating deliberately rolls PCR7 (the AWS revocation model).
 generate_and_upload_keys() {
   echo ""
   echo "No Secret ARN provided. Would you like to generate a new signing identity and upload it to AWS Secrets Manager?"
@@ -100,7 +93,6 @@ check_credentials_var() {
     return 0
   fi
 
-  # Fall back to the matching aws configure key.
   local aws_config_key=""
   case "$var_name" in
     "AWS_ACCESS_KEY_ID")
@@ -133,12 +125,10 @@ check_credentials_var() {
 
 echo "Starting deployment process..."
 
-# Display secure boot warning if secure boot mode is enabled without Secrets Manager
 if [ -n "$SECURE_BOOT_FLAG" ] && [ -z "$SECRET_MANAGER_FLAG" ]; then
   echo -e "\033[33m⚠️  WARNING: Secure boot builds are NOT reproducible (keys generated at build time)! ⚠️\033[0m"
 fi
 
-# Display debug warning if debug mode is enabled
 if [ -n "$DEBUG_FLAG" ]; then
   echo -e "\033[31m⚠️  WARNING: Building in DEBUG mode with operator access enabled! ⚠️\033[0m"
 fi
@@ -148,7 +138,6 @@ check_credentials_var AWS_ACCESS_KEY_ID
 check_credentials_var AWS_SECRET_ACCESS_KEY
 check_credentials_var AWS_DEFAULT_REGION
 
-# SESSION_TOKEN is optional: IAM users with long-term keys have none
 if [ -z "${AWS_SESSION_TOKEN:-}" ]; then
   if aws_value=$(aws configure get aws_session_token 2>/dev/null) && [ -n "$aws_value" ]; then
     export AWS_SESSION_TOKEN="$aws_value"
@@ -156,7 +145,6 @@ if [ -z "${AWS_SESSION_TOKEN:-}" ]; then
   fi
 fi
 
-# Final validation: confirm the credential chain actually works
 CALLER_IDENTITY=$(aws sts get-caller-identity --output json 2>/dev/null) || {
   echo "Error: AWS credentials are invalid. Please check your configuration."
   exit 1
@@ -165,9 +153,7 @@ CALLER_ARN=$(echo "$CALLER_IDENTITY" | jq -r '.Arn')
 
 echo "AWS credentials are set and validated."
 
-# Interactive key generation mode: generate identity and upload to Secrets Manager
 if [ -n "$SECRET_MANAGER_INTERACTIVE" ]; then
-  # Offer to reuse a retained golden identity from a previous deployment
   if [ -f "$RESOURCES_FILE" ]; then
     RETAINED_IDENTITY_ARN=$(jq -r '.IDENTITY_ARN // empty' "$RESOURCES_FILE" 2>/dev/null)
     if [ -n "$RETAINED_IDENTITY_ARN" ]; then
@@ -189,13 +175,11 @@ if [ -n "$SECRET_MANAGER_INTERACTIVE" ]; then
       fi
     fi
   fi
-  # If still in interactive mode (user declined retained identity or none found), generate new one
   if [ -n "$SECRET_MANAGER_INTERACTIVE" ]; then
     generate_and_upload_keys
   fi
 fi
 
-# Generate local signing keys when --secure-boot is used without --secrets-manager
 if [ -n "$SECURE_BOOT_FLAG" ] && [ -z "$SECRET_MANAGER_FLAG" ]; then
   LOCAL_KEY_DIR="$SCRIPT_DIR/../sb-keys"
   echo ""
@@ -213,7 +197,6 @@ if [ -n "$SECURE_BOOT_FLAG" ] && [ -z "$SECRET_MANAGER_FLAG" ]; then
   echo "Secure boot key hierarchy generated at: $LOCAL_KEY_DIR"
 fi
 
-# --secrets-manager: rebuild the reproducible UEFI envelope from the persisted identity
 if [ -n "$SECURE_BOOT_FLAG" ] && [ -n "$SECRET_MANAGER_FLAG" ]; then
   echo "Rebuilding UEFI secure boot envelope from persisted identity (ESLs, uefi_data.aws)..."
   if ! rebuild_sb_envelope_from_identity "$SCRIPT_DIR/../sb-keys" "$SCRIPT_DIR/.." "$IDENTITY_ARN"; then
@@ -222,7 +205,31 @@ if [ -n "$SECURE_BOOT_FLAG" ] && [ -n "$SECRET_MANAGER_FLAG" ]; then
   echo "UEFI secure boot data generated at: $SCRIPT_DIR/../sb-keys"
 fi
 
-echo "Step 1: Creating AMI..."
+# KMS key must exist before the build: its ARN is pinned into the image and measured
+# into PCR4. Key creation is split from policy so the build can produce the PCRs
+# the attestation conditions need; policy is finalized in Step 4.
+echo "Step 1: Creating KMS key (bootstrap policy)..."
+ADMIN_ROLE_ARN="$CALLER_ARN"
+OUTPUT=$("$SCRIPT_DIR/steps/02a_create_kms_key.sh" -a "$ADMIN_ROLE_ARN")
+
+if [ $? -ne 0 ]; then
+  echo "Error: KMS key creation failed"
+  echo "$OUTPUT"
+  exit 1
+fi
+
+KMS_KEY_ARN=$(echo "$OUTPUT" | grep -oP 'KMS key created with ARN: \K.*')
+
+if [ -z "$KMS_KEY_ARN" ]; then
+  echo "Error: Unable to extract KMS key ARN from the output"
+  echo "$OUTPUT"
+  exit 1
+fi
+
+update_resource "KMS_KEY_ARN" "$KMS_KEY_ARN"
+echo "KMS key created successfully. Key ARN: $KMS_KEY_ARN"
+
+echo "Step 2: Creating AMI..."
 CREATE_AMI_ARGS="$SECURE_BOOT_FLAG $DEBUG_FLAG"
 if [ -n "$SECRET_MANAGER_FLAG" ] && [ -n "$IDENTITY_ARN" ]; then
   CREATE_AMI_ARGS="$CREATE_AMI_ARGS --identity-arn $IDENTITY_ARN"
@@ -230,7 +237,6 @@ fi
 OUTPUT=$("$SCRIPT_DIR/steps/00_create_ami.sh" $CREATE_AMI_ARGS)
 CREATE_AMI_RC=$?
 
-# Scrub local sb-keys/ after the build so key material doesn't linger on disk
 if [ -n "$SECURE_BOOT_FLAG" ] && [ -d "$SCRIPT_DIR/../sb-keys" ]; then
   rm -rf "$SCRIPT_DIR/../sb-keys"
   echo "Local sb-keys/ removed after build."
@@ -253,7 +259,7 @@ fi
 update_resource "AMI_ID" "$AMI_ID"
 echo "AMI created successfully. AMI ID: $AMI_ID"
 
-echo "Step 2: Setting up IAM role and instance profile..."
+echo "Step 3: Setting up IAM role and instance profile..."
 ROLE_NAME="TpmAttestationRole"
 INSTANCE_PROFILE_NAME="TpmAttestationProfile"
 
@@ -270,31 +276,9 @@ update_resource "ROLE_NAME" "$ROLE_NAME"
 update_resource "INSTANCE_PROFILE_NAME" "$INSTANCE_PROFILE_NAME"
 echo "IAM role and instance profile setup completed."
 
-echo "Step 3: Creating KMS key..."
-INSTANCE_ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
-ADMIN_ROLE_ARN="$CALLER_ARN"
-echo "Creating KMS key with instance role '$INSTANCE_ROLE_ARN' and admin role '$ADMIN_ROLE_ARN'..."
-# Signed image's tpm_pcr.json (PCR4+PCR7) when secure boot is active, else the unsigned baseline
-PCR_DIR=$(resolve_pcr_dir "$SCRIPT_DIR/.." "$SECURE_BOOT_FLAG")
-OUTPUT=$("$SCRIPT_DIR/steps/02_create_kms_key.sh" -r "$INSTANCE_ROLE_ARN" -a "$ADMIN_ROLE_ARN" -m "$PCR_DIR")
-
-if [ $? -ne 0 ]; then
-  echo "Error: KMS key creation failed"
-  echo "$OUTPUT"
-  exit 1
-fi
-
-KMS_KEY_ID=$(echo "$OUTPUT" | grep -oP 'KMS key created with ID: \K.*')
-
-if [ -z "$KMS_KEY_ID" ]; then
-  echo "Error: Unable to extract KMS key ID from the output"
-  echo "$OUTPUT"
-  exit 1
-fi
-
-update_resource "KMS_KEY_ID" "$KMS_KEY_ID"
-echo "KMS key created successfully. Key ID: $KMS_KEY_ID"
-
+# Wrap the DEK while the bootstrap policy still grants Encrypt, BEFORE finalize strips
+# it — so the final policy leaves admin ScheduleKeyDeletion only and the ratchet forbids
+# minting any new ciphertext post-finalize. 03 needs only the key ARN, not the PCRs.
 echo "Step 4: Creating symmetric key and user data..."
 KEY_TMPDIR=$(mktemp -d)
 chmod 700 "$KEY_TMPDIR"
@@ -302,7 +286,7 @@ KEY_FILE="$KEY_TMPDIR/symmetric_key"
 cleanup_key_file() { rm -rf "$KEY_TMPDIR"; }
 trap cleanup_key_file EXIT
 
-OUTPUT=$("$SCRIPT_DIR/steps/03_create_symmetric_key.sh" -k "$KMS_KEY_ID" --plaintext-key-out "$KEY_FILE")
+OUTPUT=$("$SCRIPT_DIR/steps/03_create_symmetric_key.sh" -k "$KMS_KEY_ARN" --plaintext-key-out "$KEY_FILE")
 
 if [ $? -ne 0 ]; then
   echo "Error: Symmetric key creation failed"
@@ -312,7 +296,23 @@ fi
 
 echo "Symmetric key and user data created successfully."
 
-echo "Step 5a: Creating certificates..."
+# Swap bootstrap policy for the real one: Decrypt gated on PCRs; kms:PutKeyPolicy and
+# kms:Encrypt revoked (admin keeps ScheduleKeyDeletion only).
+echo "Step 5: Finalizing KMS key policy with PCR conditions..."
+INSTANCE_ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
+echo "Gating key $KMS_KEY_ARN on instance role '$INSTANCE_ROLE_ARN' (admin '$ADMIN_ROLE_ARN')..."
+PCR_DIR=$(resolve_pcr_dir "$SCRIPT_DIR/.." "$SECURE_BOOT_FLAG")
+OUTPUT=$("$SCRIPT_DIR/steps/02b_finalize_kms_policy.sh" -k "$KMS_KEY_ARN" -r "$INSTANCE_ROLE_ARN" -a "$ADMIN_ROLE_ARN" -m "$PCR_DIR")
+
+if [ $? -ne 0 ]; then
+  echo "Error: KMS key policy finalization failed"
+  echo "$OUTPUT"
+  exit 1
+fi
+
+echo "KMS key policy finalized."
+
+echo "Step 6: Creating certificates..."
 OUTPUT=$("$SCRIPT_DIR/steps/05a_create_certificates.sh" -r "$ROLE_NAME" --symmetric-key "$KEY_FILE")
 
 if [ $? -ne 0 ]; then
@@ -331,7 +331,7 @@ fi
 
 echo "Certificates created successfully."
 
-echo "Step 6: Creating EBS volume..."
+echo "Step 7: Creating EBS volume..."
 AVAILABILITY_ZONE=$(aws ec2 describe-availability-zones --query 'AvailabilityZones[0].ZoneName' --output text 2>/dev/null || echo "${AWS_DEFAULT_REGION}a")
 
 echo "Creating blank EBS volume in availability zone '$AVAILABILITY_ZONE'..."
@@ -354,7 +354,7 @@ fi
 update_resource "VOLUME_ID" "$VOLUME_ID"
 echo "EBS volume created successfully. Volume ID: $VOLUME_ID"
 
-echo "Step 7: Launching EC2 instance..."
+echo "Step 8: Launching EC2 instance..."
 # Launch with a public IP so PostgreSQL mTLS is reachable from outside the VPC.
 OUTPUT=$(run_instance_step "$AMI_ID" "$INSTANCE_PROFILE_NAME" "$VOLUME_ID" "$VPC_ID_FLAG" "$DEBUG_FLAG")
 
@@ -384,7 +384,7 @@ echo "Summary:"
 echo "  - AMI ID: $AMI_ID"
 echo "  - IAM Role: $ROLE_NAME"
 echo "  - Instance Profile: $INSTANCE_PROFILE_NAME"
-echo "  - KMS Key ID: $KMS_KEY_ID"
+echo "  - KMS Key ARN (pinned into the image): $KMS_KEY_ARN"
 if [ -n "$IDENTITY_ARN" ]; then
   echo "  - Secret ARN (identity): $IDENTITY_ARN"
 fi

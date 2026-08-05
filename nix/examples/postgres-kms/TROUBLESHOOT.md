@@ -61,6 +61,35 @@ iptables -L OUTPUT -n -v | grep 169.254
 ls -la /dev/tpm0
 ```
 
+### The KMS key ARN is pinned into the image
+
+Before decrypting anything, `kms-init` compares the `key_id` in user data against
+the key ARN baked into the image at build time. **A rejection here is the check
+working.** User data is not measured into any PCR, so it cannot be trusted to
+name the key — see [KMS key pinning](./README.md#kms-key-pinning).
+
+| Journal message | Meaning |
+|---|---|
+| `built without a pinned KMS key ARN` | The image was built from a checkout whose `kms-key-arn.txt` was empty. That builds on purpose (fresh clone, CI) but cannot boot. Rebuild after `02a_create_kms_key.sh` has written the ARN. |
+| `user-data key_id '…' does not match the pinned key …` | Different key, region or account than the image is bound to. Either the wrong AMI was launched for this key, or the key was substituted. |
+| `user-data key_id '…' is not a full ARN` | `user_data.json` carries a bare key id. The comparison is exact and a bare id names neither account nor region. Regenerate user data with `03_create_symmetric_key.sh`, which now rejects a non-ARN up front. |
+| `user-data carries no key_id` | `user_data.json` is missing the field entirely. |
+| `FATAL: refusing to decrypt against an unpinned or substituted KMS key` | The wrapper line that follows any of the above. |
+
+The pinned value and the supplied one are both visible on the instance:
+
+```sh
+# What the image is bound to (derive it from the unit, not from a store glob):
+KMS_INIT=$(systemctl cat kms-init | awk -F= '/^ExecStart=/{print $2; exit}')
+grep -m1 '^PINNED_KMS_KEY_ARN=' "$KMS_INIT"
+
+# What user data asked for:
+jq -r '.key_id' /run/kms-init/user_data.json
+```
+
+This cannot be fixed on the instance: the pinned ARN lives in the measured image,
+so changing it means a rebuild, a new PCR4 and a new KMS key policy.
+
 ## Step 2: Check the EBS volume and its LUKS2 format
 
 ```sh

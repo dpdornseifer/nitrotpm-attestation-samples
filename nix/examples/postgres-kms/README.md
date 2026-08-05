@@ -13,16 +13,17 @@ The following sequence describes the boot-time data flow from encrypted symmetri
 1. **Instance boots** — NitroTPM measures the Unified Kernel Image (UKI) into PCR registers (PCR4 for the UKI, PCR7 for secure boot if enabled).
 2. **`kms-init.service` starts** after `network-online.target` is reached.
 3. **Fetches IMDSv2 token** and reads EC2 user data containing the KMS `key_id`, the base64-encoded encrypted `ciphertext`, and the encrypted `server_cert_bundle`.
-4. **Calls `nitro-tpm-kms-decrypt`** which presents the TPM attestation document (including PCR measurements) to AWS KMS.
-5. **KMS validates PCR measurements** against the key policy conditions. If the measurements match the golden reference, KMS decrypts the ciphertext.
-6. **Decrypted symmetric key** is written to `/run/kms-init/symmetric_key` (tmpfs, mode 0750, kms-init group).
-7. **`luks-unlock.service` starts** and reads the symmetric key.
-8. **LUKS volume management:**
+4. **Checks `key_id` against the KMS key ARN pinned into the image** and refuses to continue on any mismatch — user data is not measured into any PCR, so it cannot be trusted to name the key (see [KMS key pinning](#kms-key-pinning)).
+5. **Calls `nitro-tpm-kms-decrypt`** with the *pinned* ARN, which presents the TPM attestation document (including PCR measurements) to AWS KMS.
+6. **KMS validates PCR measurements** against the key policy conditions. If the measurements match the golden reference, KMS decrypts the ciphertext.
+7. **Decrypted symmetric key** is written to `/run/kms-init/symmetric_key` (tmpfs, mode 0750, kms-init group).
+8. **`luks-unlock.service` starts** and reads the symmetric key.
+9. **LUKS volume management:**
    - *First boot:* `cryptsetup luksFormat` + `luksOpen` + `mkfs.ext4` on `/dev/mapper/data`
    - *Subsequent boot:* `cryptsetup luksOpen` only
-9. **`cert-init.service` starts** — fetches the encrypted server certificate bundle from user data via IMDS, decrypts it using the symmetric key, and writes the CA cert, server cert, and server key to `/run/postgresql-certs/` with correct ownership and permissions.
-10. **`data.mount`** mounts `/dev/mapper/data` to `/data` as ext4.
-11. **`postgresql.service` starts** with its data directory at `/data/postgresql`, SSL enabled, and `clientcert=verify-full` enforced for all remote connections.
+10. **`cert-init.service` starts** — fetches the encrypted server certificate bundle from user data via IMDS, decrypts it using the symmetric key, and writes the CA cert, server cert, and server key to `/run/postgresql-certs/` with correct ownership and permissions.
+11. **`data.mount`** mounts `/dev/mapper/data` to `/data` as ext4.
+12. **`postgresql.service` starts** with its data directory at `/data/postgresql`, SSL enabled, and `clientcert=verify-full` enforced for all remote connections.
 
 ```
 network-online.target
@@ -44,6 +45,31 @@ network-online.target
            dataDir = /data/postgresql
            SSL + mTLS (clientcert=verify-full)
 ```
+
+## KMS key pinning
+
+EC2 user data is **not** measured into any PCR. If `kms-init` took `key_id` from user data on trust, the account operator could launch this genuine, correctly-measured AMI against a KMS key whose policy *they* control, feed it a ciphertext they made, and get an instance that unlocks an attacker-chosen LUKS volume and serves attacker-chosen mTLS certs — while presenting valid PCR4/PCR7 to a third-party verifier. The attestation would be sound; it just never said anything about *which key* was consulted.
+
+So the expected key ARN is a build input. It lives in [`kms-key-arn.txt`](./kms-key-arn.txt), ends up in the measured store closure, and [`kms-verify.sh`](./kms-verify.sh) compares user data against it by exact string equality before any decrypt. Substituting the key now requires editing the image, which changes PCR4, which the key policy refuses to decrypt for.
+
+This makes key provisioning two-phase, because pinning otherwise makes the dependency graph circular — the ARN must be known *before* the build, but the PCR-gated key policy can only be written *after* it:
+
+| Step | Script | What it does |
+|---|---|---|
+| 1 | [`02a_create_kms_key.sh`](./scripts/steps/02a_create_kms_key.sh) | Creates the key under a bootstrap policy granting the provisioning principal `kms:PutKeyPolicy` + `kms:Encrypt` + `kms:ScheduleKeyDeletion` — no `Decrypt`, no attestation conditions — and writes the ARN to `kms-key-arn.txt`. |
+| 2 | `00_create_ami.sh` | Builds and measures the image, with the ARN inside it. |
+| 3 | [`03_create_symmetric_key.sh`](./scripts/steps/03_create_symmetric_key.sh) | Wraps the symmetric key under the pinned key, using the bootstrap `kms:Encrypt` grant — **before** finalize revokes it. |
+| 4 | [`02b_finalize_kms_policy.sh`](./scripts/steps/02b_finalize_kms_policy.sh) | Installs the real PCR-gated policy and **revokes `kms:PutKeyPolicy` and `kms:Encrypt` in the same call**, leaving the provisioning principal `kms:ScheduleKeyDeletion` only. |
+
+Step 4 is a one-way ratchet: after it, nobody — including the account admin — can widen the policy or mint a new ciphertext to bypass the NitroTPM conditions. `03_create_symmetric_key.sh` wraps the DEK in step 3, while the bootstrap `kms:Encrypt` grant is still in place; step 4 then revokes `Encrypt` (and `PutKeyPolicy`), so no principal can produce another valid ciphertext afterward. Nothing is exposed before finalize either: the only ciphertext is the deployer's own DEK, and `Decrypt` is gated on the PCRs from the outset.
+
+Three consequences worth knowing before you build:
+
+- **`kms-key-arn.txt` must stay git-tracked.** When the flake ref resolves to `git+file://`, Nix only sees git-tracked paths, so an untracked file is invisible to the build. Edits to an already-tracked file *are* picked up from the dirty worktree, which is what makes the rewrite work. `02a` refuses to create a key if the file is untracked, so you find out before an orphan key exists.
+- **An empty file means unpinned.** That keeps a fresh clone and CI buildable without AWS. The resulting image fails closed at boot rather than falling back to trusting user data. `clean.sh` truncates the file back to empty.
+- **The AMI is bound to one account, region and key.** A new key means a rebuild, a new PCR4 and a new policy, so `clean.sh` followed by `start.sh` can no longer reuse an image. That is inherent to pinning, not a limitation of this implementation — it turns the AMI from a reusable artifact into a per-deployment build.
+
+**Scope.** Pinning fixes *which key* is consulted, not *which ciphertext*. Because finalize revokes `kms:Encrypt`, no principal can wrap a fresh symmetric key under the pinned key after deployment, so the ciphertext-substitution vector is closed for the standing policy — the only wrap happens during provisioning (step 3), before the ratchet. The deployer necessarily sees that one plaintext DEK, since `05a_create_certificates.sh` needs it; trusting the deployer at provisioning time is inherent. Pinning a KMS *alias* ARN would sidestep the circularity but give up the property: `UpdateAlias` is mutable and would re-point the trust root without touching the image.
 
 ## Prerequisites
 
@@ -118,6 +144,7 @@ The following IAM permissions are required for the full end-to-end deployment fl
       "Effect": "Allow",
       "Action": [
         "kms:CreateKey",
+        "kms:PutKeyPolicy",
         "kms:Encrypt",
         "kms:ScheduleKeyDeletion"
       ],
@@ -178,11 +205,12 @@ The following IAM permissions are required for the full end-to-end deployment fl
 }
 ```
 
-The KMS key policy created by the deployment script grants the provisioning
-principal only `kms:Encrypt` and `kms:ScheduleKeyDeletion` on the new key. It
-does not grant `kms:PutKeyPolicy`, `kms:CreateGrant`, or decrypt permissions, so
-the attestation condition remains the only path for decrypting the wrapped
-symmetric key.
+The finalized KMS key policy grants the provisioning principal only
+`kms:ScheduleKeyDeletion` on the new key (`kms:Encrypt` is used during
+provisioning under the bootstrap policy and revoked at finalize). It does not
+grant `kms:PutKeyPolicy`, `kms:CreateGrant`, `kms:Encrypt`, or decrypt
+permissions, so the attestation condition remains the only path for decrypting
+the wrapped symmetric key.
 
 ## Getting Started
 
@@ -243,6 +271,7 @@ Run the following script to build the Attestable image and set up the necessary 
 
 This script performs the following actions:
 
+* Creates the KMS key first, under a bootstrap policy, and pins its ARN into `kms-key-arn.txt` so the build measures it (see [KMS key pinning](#kms-key-pinning))
 * Builds an image with NixOS containing:
     * [KMS decrypt application](https://github.com/aws/NitroTPM-Tools/blob/main/nitro-tpm-attest/examples/kms_decrypt.rs) for fetching attestation documents and decrypting ciphertexts
     * [Systemd service](./kms-init.nix) to decrypt and store the symmetric key on system boot
@@ -250,20 +279,21 @@ This script performs the following actions:
     * [Certificate init service](./cert-init.nix) to decrypt the server TLS certificate bundle at boot
     * PostgreSQL service configured with SSL and mTLS (`clientcert=verify-full`) on the encrypted volume
 * Creates an AMI from the image using EBS direct API
-* Sets up AWS resources including an instance role, KMS key with image measurements, encrypted symmetric key, and a blank EBS volume
+* Sets up AWS resources including an instance role, the finalized PCR-gated KMS key policy, an encrypted symmetric key, and a blank EBS volume
 * Generates a CA and TLS certificates, encrypts the server bundle into user data, and stores the client bundle in AWS Secrets Manager
-* Launches an EC2 instance using the new AMI with the EBS volume attached as `/dev/xvdf`. The instance's user data includes the ciphertext of the symmetric key, the KMS key ID, and the encrypted server certificate bundle.
+* Launches an EC2 instance using the new AMI with the EBS volume attached as `/dev/xvdf`. The instance's user data includes the ciphertext of the symmetric key, the KMS key ARN, and the encrypted server certificate bundle.
 
 **User-data format.** The artifacts are passed to the instance as a single JSON object on EC2 user data (read at boot via IMDSv2). All binary values are single-line base64:
 
 ```json
 {
-  "key_id": "<KMS key ID>",
+  "key_id": "arn:aws:kms:<region>:<account>:key/<uuid>",
   "ciphertext": "<base64(KMS-encrypted symmetric key)>",
   "server_cert_bundle": "<base64(AES-256-CBC(tar of ca.crt + server.crt + server.key))>"
 }
 ```
 
+- `key_id` — the **full key ARN**, not a bare key id. `kms-init` compares it against the ARN pinned into the image by exact string equality and refuses to boot on a mismatch, so a bare id fails every boot. `aws kms encrypt --key-id` accepts either form, which is why `03_create_symmetric_key.sh` validates it up front.
 - `ciphertext` — the symmetric key, encrypted with KMS; `kms-init` decrypts it only if the instance's PCRs satisfy the KMS key policy.
 - `server_cert_bundle` — a tarball of the server certs encrypted with that symmetric key (not KMS), so `cert-init` must run after `kms-init`.
 
