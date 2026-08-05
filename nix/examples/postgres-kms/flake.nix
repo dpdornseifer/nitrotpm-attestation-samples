@@ -82,6 +82,28 @@
               };
             };
 
+            # dm-integrity backs the authenticated-encryption layer that luks-init
+            # formats the data volume with.
+            boot.kernelModules = [ "dm-integrity" ];
+
+            # /dev/mapper/data only appears once luksFormat's integrity-tag wipe
+            # finishes, which is ~90s on a 10 GiB volume and scales with size.
+            # data.mount gets an implicit Requires= on this device from What=, and a
+            # device unit's JobRunningTimeoutSec defaults to DefaultDeviceTimeoutSec
+            # (90s). systemd.unit(5) documents that job timeout as independent of the
+            # TimeoutStartSec set on luks-unlock, so first boot raced it: the device
+            # job timed out, data.mount's job was discarded, and nothing re-queued it
+            # when luks-unlock succeeded seconds later. Scoped to this one device
+            # rather than raising DefaultDeviceTimeoutSec globally, which would make
+            # any genuinely absent device stall boot for the same duration.
+            systemd.units."dev-mapper-data.device" = {
+              overrideStrategy = "asDropin";
+              text = ''
+                [Unit]
+                JobRunningTimeoutSec=1800s
+              '';
+            };
+
             systemd.services.luks-unlock = {
               description = "Unlock LUKS-encrypted data volume";
               wantedBy = [ "multi-user.target" ];
@@ -91,8 +113,12 @@
                 Type = "oneshot";
                 ExecStart = luksInitScript;
                 RemainAfterExit = true;
-                # luks-init.sh waits in-process (up to 120s) for the hot-attached EBS device
-                TimeoutStartSec = "180s";
+                # luks-init.sh waits in-process (up to 120s) for the hot-attached
+                # EBS device. On first boot it then formats with --integrity,
+                # which wipes the authentication tags across the whole device
+                # before mkfs — a full-device write, so this needs far more than
+                # the 180s that sufficed for length-preserving encryption.
+                TimeoutStartSec = "1800s";
                 # Runs as root (needs block device access)
                 ProtectKernelTunables = true;
                 ProtectControlGroups = true;
@@ -108,7 +134,11 @@
               wantedBy = [ "multi-user.target" ];
               requires = [ "luks-unlock.service" ];
               after = [ "luks-unlock.service" ];
-              options = "defaults";
+              # The volume is operator-attachable, so treat its contents as
+              # untrusted: nothing on it should ever be executable or setuid.
+              # PostgreSQL runs nothing out of $PGDATA — extensions load from
+              # $libdir in the read-only store — so noexec is safe here.
+              options = "defaults,nodev,nosuid,noexec";
               unitConfig = {
                 # Keep out of local-fs.target to avoid a dependency cycle:
                 # data.mount → luks-unlock → kms-init → basic.target → local-fs.target → data.mount

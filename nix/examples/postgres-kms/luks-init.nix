@@ -6,10 +6,20 @@ pkgs.writeScript "luks-init.sh" ''
   #!${pkgs.bash}/bin/bash
   set -euo pipefail
 
+  CRYPTSETUP=${pkgs.cryptsetup}/bin/cryptsetup
+
+  # Sourced from the store (dm-verity / PCR4); provides luks_verify_header_json and luks_verify_status.
+  LUKS_JQ=${pkgs.jq}/bin/jq
+  . ${./luks-verify.sh}
+
+  fail() { echo "FATAL: $*" >&2; exit 1; }
+
+  # Always close on rejection: a stale mapping blocks retries and exposes /dev/mapper/data even when data.mount is blocked.
+  close_mapping() { $CRYPTSETUP close data 2>/dev/null || true; }
+
   KEY=$(cat /run/kms-init/symmetric_key)
 
-  # The EBS volume is hot-attached after the instance is "running", so the
-  # device (xvdf, or nvme1n1 on Nitro) may not exist yet — wait for it.
+  # EBS is hot-attached after "running"; poll until the device appears.
   DATA_DEV=""
   for _ in $(${pkgs.coreutils}/bin/seq 60); do
     if [ -e /dev/xvdf ]; then
@@ -28,14 +38,44 @@ pkgs.writeScript "luks-init.sh" ''
   fi
   echo "Using data device: $DATA_DEV"
 
-  # Check if the device is already LUKS-formatted (first boot vs subsequent boot)
-  if ! ${pkgs.cryptsetup}/bin/cryptsetup isLuks "$DATA_DEV"; then
-    # First boot: format, open, and create filesystem
-    echo "$KEY" | ${pkgs.cryptsetup}/bin/cryptsetup luksFormat "$DATA_DEV" --key-file=-
-    echo "$KEY" | ${pkgs.cryptsetup}/bin/cryptsetup luksOpen "$DATA_DEV" data --key-file=-
-    ${pkgs.e2fsprogs}/bin/mkfs.ext4 /dev/mapper/data
+  # Zero the 16 MiB LUKS2 metadata region on any post-luksFormat failure so the next boot re-initialises rather than treating a headerless volume as tampered.
+  rollback_format() {
+    echo "Rolling back partial initialisation of $DATA_DEV" >&2
+    close_mapping
+    ${pkgs.coreutils}/bin/dd if=/dev/zero of="$DATA_DEV" bs=1M count=16 \
+      conv=fsync status=none 2>/dev/null || true
+  }
+
+  # A header with wrong parameters is a tamper signal — never silently reformat, that destroys data and hides the evidence.
+  if ! $CRYPTSETUP isLuks --type luks2 "$DATA_DEV"; then
+    echo "No LUKS2 header found; formatting with authenticated encryption..."
+    echo "$KEY" | $CRYPTSETUP luksFormat --type luks2 \
+      --cipher "$LUKS_EXPECTED_CIPHER" \
+      --key-size "$LUKS_EXPECTED_KEYSIZE" \
+      --integrity "$LUKS_EXPECTED_INTEGRITY_ARG" \
+      --sector-size "$LUKS_EXPECTED_SECTOR_SIZE" \
+      --batch-mode \
+      "$DATA_DEV" --key-file=- \
+      || { rollback_format; fail "luksFormat failed on $DATA_DEV"; }
+
+    echo "$KEY" | $CRYPTSETUP luksOpen --type luks2 "$DATA_DEV" data --key-file=- \
+      || { rollback_format; fail "luksOpen failed on the freshly formatted $DATA_DEV"; }
+
+    luks_verify_status "$($CRYPTSETUP status data)" \
+      || { rollback_format; fail "freshly formatted volume does not match the pinned format"; }
+
+    ${pkgs.e2fsprogs}/bin/mkfs.ext4 /dev/mapper/data \
+      || { rollback_format; fail "mkfs.ext4 failed on /dev/mapper/data"; }
   else
-    # Subsequent boot: just open the existing LUKS volume
-    echo "$KEY" | ${pkgs.cryptsetup}/bin/cryptsetup luksOpen "$DATA_DEV" data --key-file=-
+    META=$($CRYPTSETUP luksDump --dump-json-metadata "$DATA_DEV") \
+      || fail "cannot read LUKS2 JSON metadata from $DATA_DEV"
+    luks_verify_header_json "$META" \
+      || fail "refusing to open $DATA_DEV: header was tampered with"
+
+    echo "$KEY" | $CRYPTSETUP luksOpen --type luks2 "$DATA_DEV" data --key-file=-
+
+    # luksOpen success proves only key correctness; verify the active mapping parameters and close (not zero) on mismatch to preserve tamper evidence.
+    luks_verify_status "$($CRYPTSETUP status data)" \
+      || { close_mapping; fail "active mapping for $DATA_DEV does not match the pinned format"; }
   fi
 ''
