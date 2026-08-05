@@ -119,8 +119,7 @@ The following IAM permissions are required for the full end-to-end deployment fl
       "Action": [
         "kms:CreateKey",
         "kms:Encrypt",
-        "kms:ScheduleKeyDeletion",
-        "kms:PutKeyPolicy"
+        "kms:ScheduleKeyDeletion"
       ],
       "Resource": "*"
     },
@@ -178,6 +177,12 @@ The following IAM permissions are required for the full end-to-end deployment fl
   ]
 }
 ```
+
+The KMS key policy created by the deployment script grants the provisioning
+principal only `kms:Encrypt` and `kms:ScheduleKeyDeletion` on the new key. It
+does not grant `kms:PutKeyPolicy`, `kms:CreateGrant`, or decrypt permissions, so
+the attestation condition remains the only path for decrypting the wrapped
+symmetric key.
 
 ## Getting Started
 

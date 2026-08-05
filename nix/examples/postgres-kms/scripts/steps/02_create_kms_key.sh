@@ -9,6 +9,8 @@ usage() {
   exit 1
 }
 
+INSTANCE_ROLE=""
+ADMIN_ROLE=""
 MEASUREMENTS="result"
 
 while [[ "$#" -gt 0 ]]; do
@@ -30,6 +32,18 @@ if [ ! -d "$MEASUREMENTS" ]; then
   echo "Error: Measurements folder '$MEASUREMENTS' does not exist."
   exit 1
 fi
+
+normalize_admin_principal() {
+  local principal="$1"
+
+  if [[ "$principal" =~ ^arn:aws[a-zA-Z-]*:sts::[0-9]{12}:assumed-role/([^/]+)/.+$ ]]; then
+    local role_name="${BASH_REMATCH[1]}"
+    aws iam get-role --role-name "$role_name" --query 'Role.Arn' --output text
+    return
+  fi
+
+  echo "$principal"
+}
 
 extract_pcr_values() {
   local measurements_file="$1"
@@ -93,10 +107,15 @@ create_kms_key_with_retry() {
 
   while [ $attempt -le $max_attempts ]; do
     local key_output exit_code
+    # The policy intentionally omits PutKeyPolicy/CreateGrant so the provisioning
+    # principal cannot later bypass the NitroTPM attestation gate.
+    set +e
     key_output=$(aws kms create-key \
       --description "NitroTPM attestation example key" \
+      --bypass-policy-lockout-safety-check \
       --policy file://"$policy_file" 2>&1)
     exit_code=$?
+    set -e
 
     # Check if output contains error information (AWS CLI can return 0 even with errors)
     if echo "$key_output" | grep -q "An error occurred"; then
@@ -137,17 +156,25 @@ if [ -z "$PCR_VALUES" ]; then
   exit 1
 fi
 
+if ! ADMIN_PRINCIPAL=$(normalize_admin_principal "$ADMIN_ROLE"); then
+  echo "Error: Failed to resolve admin principal '$ADMIN_ROLE'."
+  exit 1
+fi
+
 KEY_POLICY=$(cat <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "Allow access for Key Administrators",
+      "Sid": "Allow provisioning key lifecycle operations",
       "Effect": "Allow",
       "Principal": {
-        "AWS": "${ADMIN_ROLE}"
+        "AWS": "${ADMIN_PRINCIPAL}"
       },
-      "Action": "kms:*",
+      "Action": [
+        "kms:Encrypt",
+        "kms:ScheduleKeyDeletion"
+      ],
       "Resource": "*"
     },
     {
