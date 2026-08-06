@@ -14,6 +14,7 @@ DEBUG_FLAG=""
 TIMEOUT=600
 NO_CLEANUP=false
 SKIP_SG_UPDATE=false
+AUTHORIZE_MY_IP=false
 ADMIN_ROLE_ARN_OVERRIDE=""
 VPC_ID_FLAG=""
 SECRET_MANAGER_FLAG=""
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
     --timeout) TIMEOUT="$2"; shift; shift ;;
     --no-cleanup) NO_CLEANUP=true; shift ;;
     --skip-sg-update) SKIP_SG_UPDATE=true; shift ;;
+    --authorize-my-ip) AUTHORIZE_MY_IP=true; shift ;; # CI/CD: auto-allowlist the runner's public IP on 5432
     --admin-role-arn) ADMIN_ROLE_ARN_OVERRIDE="$2"; shift; shift ;;
     --vpc-id) VPC_ID_FLAG="--vpc-id $2"; shift; shift ;;
     --start-phase) START_PHASE="$2"; shift; shift ;; # resume a prior --no-cleanup run
@@ -44,6 +46,11 @@ done
 
 if [ -n "$SECRET_MANAGER_FLAG" ] && [ -z "$SECURE_BOOT_FLAG" ]; then
   echo "Error: --secrets-manager requires --secure-boot"
+  exit 1
+fi
+
+if [ "$AUTHORIZE_MY_IP" = true ] && [ "$SKIP_SG_UPDATE" = true ]; then
+  echo "Error: --authorize-my-ip and --skip-sg-update are mutually exclusive"
   exit 1
 fi
 
@@ -87,7 +94,11 @@ load_provisioned_state() {
     return 1
   fi
   echo "Resuming at phase $START_PHASE with instance $INSTANCE_ID (public $PUBLIC_IP)."
-  [ "$SKIP_SG_UPDATE" = false ] && print_sg_authorization_notice "$SG_ID"
+  if [ "$AUTHORIZE_MY_IP" = true ]; then
+    authorize_my_ip "$SG_ID" || return 1
+  elif [ "$SKIP_SG_UPDATE" = false ]; then
+    print_sg_authorization_notice "$SG_ID"
+  fi
 }
 
 retrieve_client_certs() {
@@ -362,7 +373,7 @@ phase1() {
   echo "Volume ID: $VOLUME_ID"
 
   echo "Step 8: Launching instance..."
-  OUTPUT=$("$SCRIPT_DIR/steps/05_run_instance.sh" -a "$AMI_ID" -p "$INSTANCE_PROFILE_NAME" -v "$VOLUME_ID" $VPC_ID_FLAG --public $DEBUG_FLAG)
+  OUTPUT=$(run_instance_step "$AMI_ID" "$INSTANCE_PROFILE_NAME" "$VOLUME_ID" "$VPC_ID_FLAG" "$DEBUG_FLAG")
   INSTANCE_ID=$(echo "$OUTPUT" | grep -oP 'Instance ID: \K.*')
   PRIVATE_IP=$(echo "$OUTPUT" | grep -oP 'Private IP: \K.*')
   PUBLIC_IP=$(echo "$OUTPUT" | grep -oP 'Public IP: \K.*')
@@ -371,7 +382,11 @@ phase1() {
   update_resource "INSTANCE_ID" "$INSTANCE_ID"
   update_resource "SECURITY_GROUP_ID" "$SG_ID"
   echo "Instance ID: $INSTANCE_ID, Private IP: $PRIVATE_IP, Public IP: $PUBLIC_IP"
-  [ "$SKIP_SG_UPDATE" = false ] && print_sg_authorization_notice "$SG_ID"
+  if [ "$AUTHORIZE_MY_IP" = true ]; then
+    authorize_my_ip "$SG_ID" || return 1
+  elif [ "$SKIP_SG_UPDATE" = false ]; then
+    print_sg_authorization_notice "$SG_ID"
+  fi
 }
 
 if [ "$START_PHASE" -le 1 ]; then
@@ -405,7 +420,7 @@ else
 fi
 
 phase2() {
-  if [ "$SKIP_SG_UPDATE" = false ] && [ -t 0 ]; then
+  if [ "$SKIP_SG_UPDATE" = false ] && [ "$AUTHORIZE_MY_IP" = false ] && [ -t 0 ]; then
     read -r -p "Add your host to SG $SG_ID:5432 (see above), then press Enter to validate... " _
   fi
 
@@ -487,7 +502,7 @@ phase3() {
   aws ec2 wait volume-available --volume-ids "$VOLUME_ID"
 
   echo "Launching second instance..."
-  OUTPUT=$("$SCRIPT_DIR/steps/05_run_instance.sh" -a "$AMI_ID" -p "$INSTANCE_PROFILE_NAME" -v "$VOLUME_ID" $VPC_ID_FLAG --public $DEBUG_FLAG)
+  OUTPUT=$(run_instance_step "$AMI_ID" "$INSTANCE_PROFILE_NAME" "$VOLUME_ID" "$VPC_ID_FLAG" "$DEBUG_FLAG")
   INSTANCE_ID=$(echo "$OUTPUT" | grep -oP 'Instance ID: \K.*')
   PRIVATE_IP=$(echo "$OUTPUT" | grep -oP 'Private IP: \K.*')
   PUBLIC_IP=$(echo "$OUTPUT" | grep -oP 'Public IP: \K.*')

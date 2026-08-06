@@ -42,6 +42,31 @@ print_sg_authorization_notice() {
   echo ""
 }
 
+# CI counterpart to the notice: allowlist the runner's public IP on 5432.
+# Idempotent (duplicate rule = success); fails hard if the IP is undetectable. Args: <sg_id>.
+authorize_my_ip() {
+  local sg_id="$1" my_ip err
+  if [ -z "$sg_id" ]; then
+    echo "Error: authorize_my_ip called without a security group id." >&2
+    return 1
+  fi
+  my_ip=$(curl -s --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]')
+  if [ -z "$my_ip" ]; then
+    echo "Error: could not detect public IP via checkip.amazonaws.com; cannot authorize SG $sg_id." >&2
+    return 1
+  fi
+  echo "Authorizing $my_ip/32 on SG $sg_id:5432 (--authorize-my-ip)..."
+  if err=$(aws ec2 authorize-security-group-ingress \
+        --group-id "$sg_id" --protocol tcp --port 5432 --cidr "$my_ip/32" 2>&1); then
+    echo "Authorized $my_ip/32 on $sg_id:5432."
+  elif printf '%s' "$err" | grep -q 'InvalidPermission.Duplicate'; then
+    echo "$my_ip/32 already authorized on $sg_id:5432."
+  else
+    echo "Error: failed to authorize $my_ip/32 on $sg_id: $err" >&2
+    return 1
+  fi
+}
+
 # Atomically persist KEY=VALUE into $RESOURCES_FILE (caller's global).
 update_resource() {
   local KEY=$1
