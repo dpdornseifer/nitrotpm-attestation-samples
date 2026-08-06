@@ -193,6 +193,8 @@
             services.postgresql = {
               enable = true;
               dataDir = "/data/postgresql";
+              # Defense in depth: per-page checksums catch torn/spliced pages that slip past dm-integrity.
+              initdbArgs = [ "--data-checksums" ];
               initialScript = pkgs.writeText "init-postgres-client.sql" ''
                 CREATE ROLE "postgres-client" WITH LOGIN;
                 GRANT ALL ON SCHEMA public TO "postgres-client";
