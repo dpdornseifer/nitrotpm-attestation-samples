@@ -223,6 +223,47 @@
               '';
             };
 
+            # Block a planted /data/postgresql/.psqlrc from running \! shell escapes as postgres:
+            # PSQLRC=/dev/null, HOME off the untrusted volume, and sandbox to contain any shell.
+            users.users.postgres.home = lib.mkForce "/var/empty";
+
+            systemd.services.postgresql-setup = {
+              environment.PSQLRC = "/dev/null";
+              serviceConfig = {
+                # initdb writes PGDATA on the volume; strict rootfs must allow it.
+                ReadWritePaths = [ "/data" ];
+
+                ProtectSystem = "strict";
+                ProtectHome = true;
+                ProtectProc = "invisible";
+                ProcSubset = "pid";
+                ProtectKernelTunables = true;
+                ProtectKernelModules = true;
+                ProtectKernelLogs = true;
+                ProtectControlGroups = true;
+                ProtectClock = true;
+                ProtectHostname = true;
+
+                PrivateTmp = true;
+
+                # Local psql connects over the /run/postgresql unix socket — no INET needed.
+                RestrictAddressFamilies = [ "AF_UNIX" ];
+                RestrictRealtime = true;
+                RestrictSUIDSGID = true;
+                RestrictNamespaces = true;
+
+                NoNewPrivileges = true;
+                LockPersonality = true;
+                MemoryDenyWriteExecute = true;
+                RemoveIPC = true;
+
+                CapabilityBoundingSet = "";
+                SystemCallArchitectures = "native";
+                SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+                SystemCallErrorNumber = "EPERM";
+              };
+            };
+
             systemd.services.postgresql = {
               requires = [ "data.mount" "postgresql-datadir-init.service" "cert-init.service" ];
               after = [ "data.mount" "postgresql-datadir-init.service" "cert-init.service" ];
