@@ -198,6 +198,8 @@
               initialScript = pkgs.writeText "init-postgres-client.sql" ''
                 CREATE ROLE "postgres-client" WITH LOGIN;
                 GRANT ALL ON SCHEMA public TO "postgres-client";
+                -- Disable the bootstrap superuser; nothing re-logs in as postgres post-init.
+                ALTER ROLE postgres NOLOGIN;
               '';
               settings = {
                 ssl = "on";
@@ -206,10 +208,18 @@
                 ssl_ca_file = "/run/postgresql-certs/ca.crt";
                 listen_addresses = lib.mkForce "*";
               };
+              # Only CN=postgres-client maps to a role (via the mtls map); the superuser is
+              # rejected over TCP. Closes the network-superuser path; the deployer still
+              # holds the CA key — see README Production Considerations.
+              identMap = ''
+                mtls /^postgres-client$ postgres-client
+              '';
               authentication = lib.mkForce ''
                 local all all peer
-                hostssl all all 0.0.0.0/0 cert clientcert=verify-full
-                hostssl all all ::/0 cert clientcert=verify-full
+                hostssl all postgres        0.0.0.0/0 reject
+                hostssl all postgres        ::/0      reject
+                hostssl all postgres-client 0.0.0.0/0 cert clientcert=verify-full map=mtls
+                hostssl all postgres-client ::/0      cert clientcert=verify-full map=mtls
               '';
             };
 
