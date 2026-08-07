@@ -37,11 +37,20 @@
           commonUserConfig = { config, pkgs, lib, ... }: {
             users.groups.tpm = {};
             users.groups.kms-init = {};
+            users.groups.cert-init = {};
 
             users.users.kms-init = {
               isSystemUser = true;
               group = "kms-init";
               extraGroups = [ "tpm" ];
+            };
+
+            # Dedicated uid for the cert-decrypt parser; group kms-init lets it read
+            # /run/kms-init/{user_data.json,symmetric_key} without running as root.
+            users.users.cert-init = {
+              isSystemUser = true;
+              group = "cert-init";
+              extraGroups = [ "kms-init" ];
             };
 
 
@@ -150,6 +159,9 @@
               requires = [ "kms-init.service" ];
               after = [ "kms-init.service" ];
               before = [ "postgresql.service" ];
+              # Parses operator-controlled bytes (base64|openssl|tar) with the disk key beside
+              # it — confine like kms-init so a parser RCE can't escalate or exfil. Ownership
+              # fixup that needs CAP_CHOWN is split into cert-init-perms.service.
               serviceConfig = {
                 Type = "oneshot";
                 ExecStart = certInitScript;
@@ -157,7 +169,14 @@
                 RuntimeDirectory = "postgresql-certs";
                 RuntimeDirectoryMode = "0750";
 
+                User = "cert-init";
+                UMask = "0077";   # extracted files start 0600; perms unit widens for postgres
+
                 ReadOnlyPaths = [ "/run/kms-init" ];
+
+                # No network: kms-init already persisted the user-data.
+                PrivateNetwork = true;
+                RestrictAddressFamilies = [ "AF_UNIX" ];
 
                 ProtectSystem = "strict";
                 ProtectKernelTunables = true;
@@ -166,13 +185,79 @@
                 ProtectKernelModules = true;
                 ProtectHome = true;
                 ProtectHostname = true;
+                ProtectProc = "invisible";
+                ProcSubset = "pid";
 
                 PrivateTmp = true;
+                PrivateUsers = true;
+
+                DevicePolicy = "closed";
+
+                RestrictRealtime = true;
+                RestrictSUIDSGID = true;
+                RestrictNamespaces = true;
 
                 NoNewPrivileges = true;
-                RestrictSUIDSGID = true;
                 LockPersonality = true;
                 MemoryDenyWriteExecute = true;
+                RemoveIPC = true;
+
+                CapabilityBoundingSet = "";
+                SystemCallArchitectures = "native";
+                SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+                SystemCallErrorNumber = "EPERM";
+              };
+            };
+
+            # Privileged ownership fixup, split out of the parsing unit: fixed paths only,
+            # no operator bytes, no decoder. Holds just the caps chown/chmod require.
+            systemd.services.cert-init-perms = {
+              description = "Set postgres ownership on decrypted PostgreSQL certs";
+              wantedBy = [ "multi-user.target" ];
+              requires = [ "cert-init.service" ];
+              after = [ "cert-init.service" ];
+              before = [ "postgresql.service" ];
+              script = ''
+                ${pkgs.coreutils}/bin/chown root:postgres /run/postgresql-certs
+                ${pkgs.coreutils}/bin/chown postgres:postgres /run/postgresql-certs/ca.crt /run/postgresql-certs/server.crt /run/postgresql-certs/server.key
+                ${pkgs.coreutils}/bin/chmod 0640 /run/postgresql-certs/ca.crt /run/postgresql-certs/server.crt
+                ${pkgs.coreutils}/bin/chmod 0600 /run/postgresql-certs/server.key
+              '';
+              serviceConfig = {
+                Type = "oneshot";
+                RemainAfterExit = true;
+                ReadWritePaths = [ "/run/postgresql-certs" ];
+
+                ProtectSystem = "strict";
+                ProtectHome = true;
+                ProtectProc = "invisible";
+                ProcSubset = "pid";
+                ProtectKernelTunables = true;
+                ProtectKernelModules = true;
+                ProtectKernelLogs = true;
+                ProtectControlGroups = true;
+                ProtectClock = true;
+                ProtectHostname = true;
+
+                PrivateTmp = true;
+                PrivateNetwork = true;
+                RestrictAddressFamilies = [ "AF_UNIX" ];
+                RestrictRealtime = true;
+                RestrictSUIDSGID = true;
+                RestrictNamespaces = true;
+
+                NoNewPrivileges = true;
+                LockPersonality = true;
+                MemoryDenyWriteExecute = true;
+                RemoveIPC = true;
+
+                # chown needs CAP_CHOWN; chmod on non-self-owned files needs CAP_FOWNER;
+                # traversing the parser-owned dir needs CAP_DAC_OVERRIDE.
+                CapabilityBoundingSet = [ "CAP_CHOWN" "CAP_FOWNER" "CAP_DAC_OVERRIDE" ];
+                SystemCallArchitectures = "native";
+                # @chown is privileged, so re-add it after subtracting @privileged.
+                SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" "@chown" ];
+                SystemCallErrorNumber = "EPERM";
               };
             };
 
@@ -265,8 +350,8 @@
             };
 
             systemd.services.postgresql = {
-              requires = [ "data.mount" "postgresql-datadir-init.service" "cert-init.service" ];
-              after = [ "data.mount" "postgresql-datadir-init.service" "cert-init.service" ];
+              requires = [ "data.mount" "postgresql-datadir-init.service" "cert-init-perms.service" ];
+              after = [ "data.mount" "postgresql-datadir-init.service" "cert-init-perms.service" ];
               serviceConfig = {
                 ReadOnlyPaths = [ "/run/postgresql-certs" ];
               };
