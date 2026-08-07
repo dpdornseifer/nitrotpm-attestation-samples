@@ -59,9 +59,9 @@ This makes key provisioning two-phase, because pinning otherwise makes the depen
 | 1 | [`02a_create_kms_key.sh`](./scripts/steps/02a_create_kms_key.sh) | Creates the key under a bootstrap policy granting the provisioning principal `kms:PutKeyPolicy` + `kms:Encrypt` + `kms:ScheduleKeyDeletion` — no `Decrypt`, no attestation conditions — and writes the ARN to `kms-key-arn.txt`. |
 | 2 | `00_create_ami.sh` | Builds and measures the image, with the ARN inside it. |
 | 3 | [`03_create_symmetric_key.sh`](./scripts/steps/03_create_symmetric_key.sh) | Wraps the symmetric key under the pinned key, using the bootstrap `kms:Encrypt` grant — **before** finalize revokes it. |
-| 4 | [`02b_finalize_kms_policy.sh`](./scripts/steps/02b_finalize_kms_policy.sh) | Installs the real PCR-gated policy and **revokes `kms:PutKeyPolicy` and `kms:Encrypt` in the same call**, leaving the provisioning principal `kms:ScheduleKeyDeletion` only. |
+| 4 | [`02b_finalize_kms_policy.sh`](./scripts/steps/02b_finalize_kms_policy.sh) | Installs the real PCR-gated policy and **drops `kms:PutKeyPolicy` and `kms:Encrypt` in the same call**, leaving the provisioning principal only `kms:ScheduleKeyDeletion` + `kms:ListGrants`/`kms:RevokeGrant` (for grant audit — see [Production Considerations](#production-considerations)). |
 
-Step 4 is a one-way ratchet: after it, nobody — including the account admin — can widen the policy or mint a new ciphertext to bypass the NitroTPM conditions. `03_create_symmetric_key.sh` wraps the DEK in step 3, while the bootstrap `kms:Encrypt` grant is still in place; step 4 then revokes `Encrypt` (and `PutKeyPolicy`), so no principal can produce another valid ciphertext afterward. Nothing is exposed before finalize either: the only ciphertext is the deployer's own DEK, and `Decrypt` is gated on the PCRs from the outset.
+Step 4 is a one-way ratchet: by revoking `kms:Encrypt` and `kms:PutKeyPolicy` in the same call that installs the PCR-gated policy, it leaves no principal — including the account admin — able to widen the policy or wrap a new ciphertext that bypasses the NitroTPM conditions. Nothing is exposed before finalize either: the only ciphertext is the deployer's own DEK (wrapped in step 3 under the still-present `Encrypt` grant), and `Decrypt` is PCR-gated from the outset.
 
 Three consequences worth knowing before you build:
 
@@ -205,12 +205,14 @@ The following IAM permissions are required for the full end-to-end deployment fl
 }
 ```
 
-The finalized KMS key policy grants the provisioning principal only
-`kms:ScheduleKeyDeletion` on the new key (`kms:Encrypt` is used during
-provisioning under the bootstrap policy and revoked at finalize). It does not
-grant `kms:PutKeyPolicy`, `kms:CreateGrant`, `kms:Encrypt`, or decrypt
-permissions, so the attestation condition remains the only path for decrypting
-the wrapped symmetric key.
+The finalized KMS key policy grants the provisioning principal
+`kms:ScheduleKeyDeletion` plus `kms:ListGrants`/`kms:RevokeGrant` (so grants
+stay auditable and revocable — see [Production Considerations](#production-considerations)).
+`kms:Encrypt` is used during provisioning under the bootstrap policy and dropped
+at finalize; the final policy grants no `kms:PutKeyPolicy`, `kms:CreateGrant`,
+`kms:Encrypt`, or decrypt permissions. Before swapping the policy, finalize
+refuses to proceed if any grant already exists on the key, so the attestation
+condition remains the only path for decrypting the wrapped symmetric key.
 
 ## Getting Started
 
@@ -428,6 +430,32 @@ Then connect with full verification:
 ```sh
 psql "sslmode=verify-full sslcert=/tmp/client.crt sslkey=/tmp/client.key sslrootcert=/tmp/ca.crt host=postgres.internal.example.com port=5432 dbname=postgres user=postgres-client"
 ```
+
+## Production Considerations
+
+This example is a demonstrator. A production deployment additionally requires:
+
+- **Split the deployment role from the operator role.** The principal that provisions the key sees the plaintext DEK at wrap time (step 3) and holds `kms:ScheduleKeyDeletion` afterward. Day-to-day operators who launch, reattach, or terminate instances must not inherit those rights — give them a separate role scoped to EC2/EBS so no standing identity can both mint ciphertext and destroy the key.
+- **The KMS key ARN is baked into the AMI, not taken from user data.** User data is not measured into any PCR, so a `key_id` supplied there cannot be trusted; pinning the ARN into the measured image (`kms-key-arn.txt` → PCR4) is what binds the attestation to *which* key is consulted (see [KMS key pinning](#kms-key-pinning)).
+- **KMS grants are checked and kept revocable, because the policy swap doesn't cover them.** Grants are a separate authorization instrument — exempt from the policy's PCR conditions and untouched by `put-key-policy`. In the bootstrap window (step 1) the provisioning principal holds `kms:PutKeyPolicy`, which transitively allows planting a `kms:CreateGrant`; such a grant would give its grantee attestation-free `Decrypt` that survives finalize. Two measures close this: finalize (`02b`) **fails closed** if any grant exists before it swaps the policy, and the final policy keeps `kms:ListGrants`/`kms:RevokeGrant` on the admin so grants stay detectable and revocable. The window itself is unavoidable — PCR4 measures the pinned key ARN, so the key must exist before the image, ruling out single-shot creation with the final policy. A malicious admin could still *transiently* plant a grant; the finalize check is what catches it, so treat a non-empty `aws kms list-grants` at any time as an incident.
+- **The symmetric key is generated in the provisioning pipeline, not inside the TEE.** This is a deliberate recoverability-vs-custody tradeoff — see [DEK custody: pipeline vs. TEE generation](#dek-custody-pipeline-vs-tee-generation) below.
+- **Private (no public IP) deployment needs a KMS interface VPC endpoint.** This example launches with a public IP so mTLS is reachable and `kms-init` can reach the public KMS endpoint. A production instance in a private subnet has no route to public KMS (the default VPC has an Internet Gateway but no NAT), so `kms-init` fails at boot unless the subnet has a KMS interface VPC endpoint (PrivateLink) — or a NAT gateway — reachable from the instance.
+- **Move CA issuance off the operator's machine.** mTLS auth is scoped so only a `CN=postgres-client` cert maps to the `postgres-client` role and the `postgres` superuser is rejected over TCP (`ALTER ROLE postgres NOLOGIN` makes that permanent) — this closes the network-superuser/shell path. But the deploying operator still generates the CA key locally (`05a_create_certificates.sh`), so they can mint a valid `postgres-client` cert and reach the data. mTLS here protects against superuser escalation, not against the deployer reading data. Longer term, move CA issuance off the operator's machine (e.g. AWS Private CA with an enforced subject-name policy) so CA custody is not the operator's by construction.
+
+### DEK custody: pipeline vs. TEE generation
+
+The LUKS DEK (and the mTLS bundle password, the same key) is minted **in the pipeline**: the deployer generates the plaintext, wraps it with `kms:Encrypt`, and ships the ciphertext in user data. The alternative is minting it **inside the TEE** on first boot — `luks-init` generates the key in tmpfs, `luksFormat`s, wraps it over the attested path, and stores the ciphertext as a LUKS2 token in the volume header.
+
+| | Pipeline (current) | TEE first-boot |
+|---|---|---|
+| **Custody** | Deployer sees the plaintext; can `luksOpen` on any machine | Plaintext never leaves the enclave; every unlock goes through attestation |
+| **Recovery** | Out-of-band with the held plaintext | Relaunch the *same measured AMI* (PCR4/PCR7 must match) + attach the volume |
+| **Durability** | Ciphertext lives in the launch template | Only copy is the volume header → needs an off-volume `luksHeaderBackup` |
+| **Boot logic** | `kms-init` decrypts a user-data blob | Extra first-boot generate/format/wrap (idempotent via the header check) |
+
+The TEE model shifts the discipline from "guard the plaintext key file" to "guard the KMS key and the AMI": never `ScheduleKeyDeletion` while data is needed, retain the exact AMI + secure-boot identity, keep a `luksHeaderBackup` (it is ciphertext — useless without KMS and a matching-PCR attestation).
+
+Adopting it touches four places: `luks-init.nix` gains first-boot keygen/wrap and later-boot unwrap; `03_create_symmetric_key.sh` drops keygen; the KMS policy grants PCR-gated `kms:Encrypt` to the **instance role** rather than the deployer (so Encrypt can only be pinned to the attested role, not revoked outright); `05a_create_certificates.sh` wraps the server bundle the same way. A lighter interim step — a mandatory first-boot re-key (`luksAddKey` a TEE key, `luksKillSlot` the operator slot) — shrinks but does not remove custody, since the plaintext still existed on the operator's machine at provisioning.
 
 ## Cleanup
 
