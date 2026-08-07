@@ -1,9 +1,8 @@
 #!/bin/bash
-# Phase one of two-step KMS provisioning: create the key under a bootstrap policy
-# (PutKeyPolicy + Encrypt + ScheduleKeyDeletion — no Decrypt, no PCR conditions) and
-# pin the ARN into the image source before the AMI build. Encrypt is granted here so
-# 03 can wrap the DEK before 02b finalizes; finalize then strips PutKeyPolicy and
-# Encrypt, leaving admin ScheduleKeyDeletion only. 02b installs the real policy.
+# Phase one of two-step KMS provisioning: create the key under a bootstrap policy and
+# pin the ARN into the image source before the AMI build. Encrypt lets 03 wrap the DEK;
+# 02b then strips PutKeyPolicy + Encrypt. ListGrants/RevokeGrant let 02b detect and clear
+# any grant planted in this window (grants bypass the PCR policy) and persist for audit.
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -58,7 +57,7 @@ BOOTSTRAP_POLICY=$(cat <<EOF
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "Allow provisioning to wrap the DEK and install the final key policy",
+      "Sid": "Allow provisioning to wrap the DEK, install the final key policy, and audit grants",
       "Effect": "Allow",
       "Principal": {
         "AWS": "${ADMIN_PRINCIPAL}"
@@ -66,7 +65,9 @@ BOOTSTRAP_POLICY=$(cat <<EOF
       "Action": [
         "kms:PutKeyPolicy",
         "kms:Encrypt",
-        "kms:ScheduleKeyDeletion"
+        "kms:ScheduleKeyDeletion",
+        "kms:ListGrants",
+        "kms:RevokeGrant"
       ],
       "Resource": "*"
     }

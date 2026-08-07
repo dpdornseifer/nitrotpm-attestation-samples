@@ -1,7 +1,8 @@
 #!/bin/bash
-# Phase two: replace the bootstrap policy with the PCR-gated final policy.
-# One-way ratchet: drops kms:PutKeyPolicy AND kms:Encrypt in this call; admin keeps
-# only ScheduleKeyDeletion. Runs after 03 has wrapped the DEK under the bootstrap grant.
+# Phase two: replace the bootstrap policy with the PCR-gated final policy. Drops
+# PutKeyPolicy + Encrypt; admin keeps ScheduleKeyDeletion + ListGrants/RevokeGrant so
+# grants stay auditable. Fails closed if a grant was planted in the bootstrap window
+# (grants bypass the PCR condition and outlive the swap). Runs after 03 wrapped the DEK.
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -67,13 +68,15 @@ KEY_POLICY=$(cat <<EOF
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "Allow provisioning to schedule key deletion",
+      "Sid": "Allow provisioning to schedule key deletion and keep grants auditable",
       "Effect": "Allow",
       "Principal": {
         "AWS": "${ADMIN_PRINCIPAL}"
       },
       "Action": [
-        "kms:ScheduleKeyDeletion"
+        "kms:ScheduleKeyDeletion",
+        "kms:ListGrants",
+        "kms:RevokeGrant"
       ],
       "Resource": "*"
     },
@@ -103,6 +106,20 @@ trap 'rm -f "$KEY_POLICY_FILE"' EXIT
 echo "$KEY_POLICY" > "$KEY_POLICY_FILE"
 echo "Final KMS policy written to $KEY_POLICY_FILE"
 
+# Grants bypass the PCR condition and survive put-key-policy, so a planted one is a
+# no-attestation Decrypt backdoor. Refuse to finalize over any. (aws CLI v2 auto-paginates.)
+echo "Checking for grants planted during the bootstrap window..."
+if ! GRANTS=$(aws kms list-grants --key-id "$KEY_ARN" --query 'Grants[].GrantId' --output text); then
+  echo "Error: failed to list grants on $KEY_ARN; cannot confirm the key is clean." >&2
+  exit 1
+fi
+if [ -n "$GRANTS" ]; then
+  echo "Error: unexpected grant(s) on $KEY_ARN before finalize: $GRANTS" >&2
+  echo "       A grant bypasses the PCR-gated policy. Refusing to finalize; investigate and" >&2
+  echo "       revoke with: aws kms revoke-grant --key-id $KEY_ARN --grant-id <id>" >&2
+  exit 1
+fi
+
 echo "Installing the attestation-gated key policy on $KEY_ARN..."
 if ! kms_call_with_retry "KMS key policy update" put-key-policy \
       --key-id "$KEY_ARN" \
@@ -112,4 +129,4 @@ if ! kms_call_with_retry "KMS key policy update" put-key-policy \
   exit 1
 fi
 
-echo "KMS key policy finalized for $KEY_ARN (kms:PutKeyPolicy revoked)"
+echo "KMS key policy finalized for $KEY_ARN (PutKeyPolicy + Encrypt dropped; no grants present)"
