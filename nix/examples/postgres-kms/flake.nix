@@ -299,8 +299,11 @@
               identMap = ''
                 mtls /^postgres-client$ postgres-client
               '';
+              # Scope local peer to the postgres uid: with the operator-forged /data catalog,
+              # `local all all peer` let any local uid log in as a forged same-named SUPERUSER
+              # (COPY FROM PROGRAM shell). postgres-client only connects over mTLS/TCP.
               authentication = lib.mkForce ''
-                local all all peer
+                local all postgres peer
                 hostssl all postgres        0.0.0.0/0 reject
                 hostssl all postgres        ::/0      reject
                 hostssl all postgres-client 0.0.0.0/0 cert clientcert=verify-full map=mtls
