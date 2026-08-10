@@ -357,6 +357,9 @@
               after = [ "data.mount" "postgresql-datadir-init.service" "cert-init-perms.service" ];
               serviceConfig = {
                 ReadOnlyPaths = [ "/run/postgresql-certs" ];
+                # noexec: certs are read only as TLS data, so block dlopen of a
+                # polyglot ca.crt planted via session_preload_libraries (outranks -c pins).
+                NoExecPaths = [ "/run/postgresql-certs" ];
               };
             };
 
