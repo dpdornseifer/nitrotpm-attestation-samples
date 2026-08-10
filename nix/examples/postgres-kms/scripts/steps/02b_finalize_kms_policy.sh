@@ -95,6 +95,13 @@ KEY_POLICY=$(cat <<EOF
 ${PCR_VALUES}
         }
       }
+    },
+    {
+      "Sid": "Deny grant creation to everyone; grants bypass the PCR condition",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "kms:CreateGrant",
+      "Resource": "*"
     }
   ]
 }
@@ -106,26 +113,33 @@ trap 'rm -f "$KEY_POLICY_FILE"' EXIT
 echo "$KEY_POLICY" > "$KEY_POLICY_FILE"
 echo "Final KMS policy written to $KEY_POLICY_FILE"
 
-# Grants bypass the PCR condition and survive put-key-policy, so a planted one is a
-# no-attestation Decrypt backdoor. Refuse to finalize over any. (aws CLI v2 auto-paginates.)
-echo "Checking for grants planted during the bootstrap window..."
-if ! GRANTS=$(aws kms list-grants --key-id "$KEY_ARN" --query 'Grants[].GrantId' --output text); then
-  echo "Error: failed to list grants on $KEY_ARN; cannot confirm the key is clean." >&2
-  exit 1
-fi
-if [ -n "$GRANTS" ]; then
-  echo "Error: unexpected grant(s) on $KEY_ARN before finalize: $GRANTS" >&2
-  echo "       A grant bypasses the PCR-gated policy. Refusing to finalize; investigate and" >&2
-  echo "       revoke with: aws kms revoke-grant --key-id $KEY_ARN --grant-id <id>" >&2
-  exit 1
-fi
-
 echo "Installing the attestation-gated key policy on $KEY_ARN..."
 if ! kms_call_with_retry "KMS key policy update" put-key-policy \
       --key-id "$KEY_ARN" \
       --policy-name default \
       --bypass-policy-lockout-safety-check \
       --policy file://"$KEY_POLICY_FILE" >/dev/null; then
+  exit 1
+fi
+
+# Check grants AFTER finalize: a pre-check races the plant, but the final policy denies
+# CreateGrant + drops PutKeyPolicy, closing the window. Poll for CreateGrant's eventual
+# consistency. Catches accidental/third-party/tooling grants; a malicious operator who
+# single-steps this script is out of scope (see README: separation of duties).
+echo "Verifying no grants were planted during the bootstrap window..."
+GRANTS=""
+for _ in 1 2 3 4 5 6; do
+  if ! GRANTS=$(aws kms list-grants --key-id "$KEY_ARN" --query 'Grants[].GrantId' --output text); then
+    echo "Error: failed to list grants on $KEY_ARN; cannot confirm the key is clean." >&2
+    exit 1
+  fi
+  [ -n "$GRANTS" ] && break
+  sleep 5
+done
+if [ -n "$GRANTS" ]; then
+  echo "Error: grant(s) present on $KEY_ARN after finalize: $GRANTS" >&2
+  echo "       A grant bypasses the PCR-gated policy. Revoke and investigate:" >&2
+  echo "       aws kms revoke-grant --key-id $KEY_ARN --grant-id <id>" >&2
   exit 1
 fi
 
