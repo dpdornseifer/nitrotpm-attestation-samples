@@ -313,7 +313,7 @@ fi
 echo "KMS key policy finalized."
 
 echo "Step 6: Creating certificates..."
-OUTPUT=$("$SCRIPT_DIR/steps/05a_create_certificates.sh" -r "$ROLE_NAME" --symmetric-key "$KEY_FILE")
+OUTPUT=$("$SCRIPT_DIR/steps/05a_create_certificates.sh" --symmetric-key "$KEY_FILE")
 
 if [ $? -ne 0 ]; then
   echo "Error: Certificate creation failed"

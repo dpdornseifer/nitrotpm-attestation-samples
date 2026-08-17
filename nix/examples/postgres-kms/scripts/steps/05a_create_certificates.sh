@@ -2,8 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 -r <ROLE_NAME> --symmetric-key <FILE>"
-  echo "  -r, --role-name      IAM role to grant Secrets Manager read access"
+  echo "Usage: $0 --symmetric-key <FILE>"
   echo "  --symmetric-key      Path to the plaintext symmetric key file"
   exit 1
 }
@@ -13,17 +12,11 @@ SYMMETRIC_KEY=""
 while [[ "$#" -gt 0 ]]; do
   case $1 in
     -k|--kms-key-id) shift ;; # accepted for backward compat, unused
-    -r|--role-name) ROLE_NAME="$2"; shift ;;
     --symmetric-key) SYMMETRIC_KEY="$2"; shift ;;
     *) usage ;;
   esac
   shift
 done
-
-if [ -z "${ROLE_NAME:-}" ]; then
-  echo "Error: ROLE_NAME is required."
-  usage
-fi
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 ARTIFACTS_DIR="$SCRIPT_DIR/../../artifacts"
@@ -128,26 +121,8 @@ SECRET_ARN=$(aws secretsmanager create-secret \
   --output text)
 echo "Client certificate bundle stored in Secrets Manager: $SECRET_ARN"
 
-# Attach an inline IAM policy granting the instance role read access to the secret
-POLICY_DOCUMENT=$(cat <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "secretsmanager:GetSecretValue",
-      "Resource": "$SECRET_ARN"
-    }
-  ]
-}
-EOF
-)
-
-aws iam put-role-policy \
-  --role-name "$ROLE_NAME" \
-  --policy-name "SecretsManagerClientCertAccess" \
-  --policy-document "$POLICY_DOCUMENT"
-echo "IAM inline policy SecretsManagerClientCertAccess attached to role $ROLE_NAME."
+# The instance never reads this secret (its server bundle arrives via user-data);
+# only the deployer/e2e client fetches it, so the instance role gets no grant here.
 
 # Record SECRET_ARN in resources.json
 RESOURCES_FILE="$ARTIFACTS_DIR/resources.json"

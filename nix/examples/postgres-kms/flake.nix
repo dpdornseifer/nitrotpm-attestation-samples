@@ -34,6 +34,13 @@
           certInitScript = pkgs.callPackage ./cert-init.nix { };
           imdsCredentialsScript = pkgs.callPackage ./imds-credentials.nix { };
 
+          # Shared cluster bootstrap SQL. Prod appends NOLOGIN (below); debug
+          # omits it so an operator can still `sudo -u postgres psql`.
+          basePgInitSql = ''
+            CREATE ROLE "postgres-client" WITH LOGIN;
+            GRANT ALL ON SCHEMA public TO "postgres-client";
+          '';
+
           commonUserConfig = { config, pkgs, lib, ... }: {
             users.groups.tpm = {};
             users.groups.kms-init = {};
@@ -280,12 +287,12 @@
               dataDir = "/data/postgresql";
               # Defense in depth: per-page checksums catch torn/spliced pages that slip past dm-integrity.
               initdbArgs = [ "--data-checksums" ];
-              initialScript = pkgs.writeText "init-postgres-client.sql" ''
-                CREATE ROLE "postgres-client" WITH LOGIN;
-                GRANT ALL ON SCHEMA public TO "postgres-client";
-                -- Disable the bootstrap superuser; nothing re-logs in as postgres post-init.
+              # Prod hardening: disable the bootstrap superuser so a postgres-uid
+              # RCE can't open a local superuser session. Debug overrides this
+              # (drops NOLOGIN) to keep operator `sudo -u postgres psql` access.
+              initialScript = pkgs.writeText "init-postgres-client.sql" (basePgInitSql + ''
                 ALTER ROLE postgres NOLOGIN;
-              '';
+              '');
               settings = {
                 ssl = "on";
                 ssl_cert_file = "/run/postgresql-certs/server.crt";
@@ -366,9 +373,12 @@
             networking.firewall = {
               allowedTCPPorts = [ 5432 ];
               # Only kms-init may reach IMDS; all other users are dropped.
+              # IPv6 IMDS (fd00:ec2::254) is off by default and nothing here uses
+              # it, so drop it outright for every uid (no ACCEPT carve-out needed).
               extraCommands = "
                 ${pkgs.iptables}/bin/iptables -A OUTPUT -d 169.254.169.254 -m owner --uid-owner kms-init -j ACCEPT
                 ${pkgs.iptables}/bin/iptables -A OUTPUT -d 169.254.169.254 -j DROP
+                ${pkgs.iptables}/bin/ip6tables -A OUTPUT -d fd00:ec2::254 -j DROP
               ";
             };
           };
@@ -382,6 +392,11 @@
             ];
 
             services.amazon-ssm-agent.enable = true;
+
+            # Keep the bootstrap superuser LOGIN-able for `sudo -u postgres psql`
+            # inspection (prod hardens it to NOLOGIN via initialScript).
+            services.postgresql.initialScript =
+              lib.mkForce (pkgs.writeText "init-postgres-client-debug.sql" basePgInitSql);
 
             # SSM runs as root and needs IMDS; insert ACCEPT before the production DROP.
             networking.firewall.extraCommands = lib.mkAfter "

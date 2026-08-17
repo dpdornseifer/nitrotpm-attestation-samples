@@ -1,7 +1,6 @@
 **/result
 **/artifacts
 **/target
-**/flake.lock
 **/sb-keys
 **/signed-image
 **/signed.efi

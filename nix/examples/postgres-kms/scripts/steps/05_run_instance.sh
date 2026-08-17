@@ -97,6 +97,7 @@ INSTANCE_OUTPUT=$(aws ec2 run-instances \
   --security-group-ids "$SG_ID" \
   --subnet-id "$SUBNET_ID" \
   --associate-public-ip-address \
+  --metadata-options "HttpTokens=required,HttpEndpoint=enabled,HttpPutResponseHopLimit=1" \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=PostgresKMS-TEE}]" \
   --query 'Instances[0].{InstanceId:InstanceId,PrivateIpAddress:PrivateIpAddress}' \
   --output json)

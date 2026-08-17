@@ -250,20 +250,11 @@ cleanup() {
 
   local SECRET_ARN
   SECRET_ARN=$(jq -r '.SECRET_ARN // empty' "$RESOURCES_FILE" 2>/dev/null || true)
-  local ROLE_NAME
-  ROLE_NAME=$(jq -r '.ROLE_NAME // empty' "$RESOURCES_FILE" 2>/dev/null || true)
 
   if [ -n "$SECRET_ARN" ]; then
     echo "Deleting Secrets Manager secret: $SECRET_ARN"
     if ! aws secretsmanager delete-secret --secret-id "$SECRET_ARN" --force-delete-without-recovery 2>&1; then
       echo "Warning: Failed to delete Secrets Manager secret (non-critical)"
-    fi
-  fi
-
-  if [ -n "$ROLE_NAME" ]; then
-    echo "Removing inline IAM policy SecretsManagerClientCertAccess from role $ROLE_NAME..."
-    if ! aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "SecretsManagerClientCertAccess" 2>&1; then
-      echo "Warning: Failed to remove inline IAM policy (non-critical)"
     fi
   fi
 
@@ -360,7 +351,7 @@ phase1() {
     || { rm -rf "$KEY_TMPDIR"; echo "Failed to finalize KMS key policy"; return 1; }
 
   echo "Step 6: Creating certificates..."
-  "$SCRIPT_DIR/steps/05a_create_certificates.sh" -r "$ROLE_NAME" --symmetric-key "$KEY_FILE" \
+  "$SCRIPT_DIR/steps/05a_create_certificates.sh" --symmetric-key "$KEY_FILE" \
     || { rm -rf "$KEY_TMPDIR"; return 1; }
   rm -rf "$KEY_TMPDIR"
 
