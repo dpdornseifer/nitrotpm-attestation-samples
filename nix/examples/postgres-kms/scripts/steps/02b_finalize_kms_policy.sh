@@ -12,18 +12,22 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 . "$SCRIPT_DIR/../lib/kms.sh"
 
 usage() {
-  echo "Usage: $0 -k KEY_ARN -r INSTANCE_ROLE -a ADMIN_ROLE [-m MEASUREMENTS]"
+  echo "Usage: $0 -k KEY_ARN -r INSTANCE_ROLE -a ADMIN_ROLE -m MEASUREMENTS -p REQUIRE_PCRS"
   echo "  -k, --key-arn             ARN (or id) of the key created by 02a"
   echo "  -r, --instance-role       ARN of the instance role allowed to decrypt"
   echo "  -a, --admin-role          ARN of the provisioning (admin) principal"
-  echo "  -m, --measurements        Folder containing tpm_pcr.json (default: result)"
+  echo "  -m, --measurements        Folder containing tpm_pcr.json (required)"
+  echo "  -p, --require-pcrs        PCRs that MUST be gated, e.g. \"PCR4 PCR7\" (required)"
   exit 1
 }
 
 KEY_ARN=""
 INSTANCE_ROLE=""
 ADMIN_ROLE=""
-MEASUREMENTS="result"
+# No defaults: the old MEASUREMENTS="result" silently produced a PCR4-only gate.
+# finalize-key.sh decides both and explains the PCR4/PCR7 split.
+MEASUREMENTS=""
+REQUIRE_PCRS=""
 
 while [[ "$#" -gt 0 ]]; do
   case $1 in
@@ -31,13 +35,15 @@ while [[ "$#" -gt 0 ]]; do
     -r|--instance-role) INSTANCE_ROLE="$2"; shift ;;
     -a|--admin-role) ADMIN_ROLE="$2"; shift ;;
     -m|--measurements) MEASUREMENTS="$2"; shift ;;
+    -p|--require-pcrs) REQUIRE_PCRS="$2"; shift ;;
     *) usage ;;
   esac
   shift
 done
 
-if [ -z "$KEY_ARN" ] || [ -z "$INSTANCE_ROLE" ] || [ -z "$ADMIN_ROLE" ]; then
-  echo "Error: Key ARN, instance role ARN and admin role ARN are required."
+if [ -z "$KEY_ARN" ] || [ -z "$INSTANCE_ROLE" ] || [ -z "$ADMIN_ROLE" ] \
+   || [ -z "$MEASUREMENTS" ] || [ -z "$REQUIRE_PCRS" ]; then
+  echo "Error: key ARN, instance role ARN, admin role ARN, measurements folder and required PCRs are all required."
   usage
 fi
 
@@ -46,7 +52,7 @@ if [ ! -d "$MEASUREMENTS" ]; then
   exit 1
 fi
 
-if ! PCR_VALUES=$(extract_pcr_values "$MEASUREMENTS/tpm_pcr.json"); then
+if ! PCR_VALUES=$(extract_pcr_values "$MEASUREMENTS/tpm_pcr.json" "$REQUIRE_PCRS"); then
   echo "Error: Failed to extract PCR values from measurements file."
   exit 1
 fi
@@ -61,52 +67,14 @@ if ! ADMIN_PRINCIPAL=$(normalize_admin_principal "$ADMIN_ROLE"); then
   exit 1
 fi
 
-# Admin retains ScheduleKeyDeletion (for clean.sh) only; Encrypt was used under the
-# bootstrap policy before finalize, and Decrypt requires the PCR attestation condition.
-KEY_POLICY=$(cat <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "Allow provisioning to schedule key deletion and keep grants auditable",
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "${ADMIN_PRINCIPAL}"
-      },
-      "Action": [
-        "kms:ScheduleKeyDeletion",
-        "kms:ListGrants",
-        "kms:RevokeGrant"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "Allow decryption for the Instance role",
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "${INSTANCE_ROLE}"
-      },
-      "Action": [
-        "kms:Decrypt"
-      ],
-      "Resource": "*",
-      "Condition": {
-        "StringEqualsIgnoreCase": {
-${PCR_VALUES}
-        }
-      }
-    },
-    {
-      "Sid": "Deny grant creation to everyone; grants bypass the PCR condition",
-      "Effect": "Deny",
-      "Principal": "*",
-      "Action": "kms:CreateGrant",
-      "Resource": "*"
-    }
-  ]
-}
-EOF
-)
+# One canonical condition object for both the document and its read-back check: when the two
+# were built separately, the verification could disagree with what was installed.
+PCR_CONDITION="{$PCR_VALUES}"
+
+if ! KEY_POLICY=$(build_final_policy "$ADMIN_PRINCIPAL" "$INSTANCE_ROLE" "$PCR_CONDITION"); then
+  echo "Error: could not build the final key policy from the extracted PCR values." >&2
+  exit 1
+fi
 
 KEY_POLICY_FILE=$(mktemp -t kms_policy.XXXXXX.json)
 trap 'rm -f "$KEY_POLICY_FILE"' EXIT
@@ -122,10 +90,32 @@ if ! kms_call_with_retry "KMS key policy update" put-key-policy \
   exit 1
 fi
 
-# Check grants AFTER finalize: a pre-check races the plant, but the final policy denies
-# CreateGrant + drops PutKeyPolicy, closing the window. Poll for CreateGrant's eventual
-# consistency. Catches accidental/third-party/tooling grants; a malicious operator who
-# single-steps this script is out of scope (see README: separation of duties).
+# put-key-policy returning 200 proves the call was accepted, not that our document is the
+# one in force — a racing PutKeyPolicy in the bootstrap window would go unnoticed.
+echo "Verifying the policy in force gates Decrypt on the measured PCRs..."
+if ! INSTALLED_POLICY=$(aws kms get-key-policy --key-id "$KEY_ARN" \
+      --policy-name default --query Policy --output text); then
+  echo "Error: cannot read back the key policy on $KEY_ARN; cannot confirm the swap." >&2
+  exit 1
+fi
+
+if ! POLICY_FAULTS=$(kms_policy_faults "$INSTALLED_POLICY" "$INSTANCE_ROLE" "$PCR_CONDITION"); then
+  echo "Error: cannot evaluate the key policy in force on $KEY_ARN." >&2
+  exit 1
+fi
+
+if [ -n "$POLICY_FAULTS" ]; then
+  echo "Error: the policy in force on $KEY_ARN is not the one just installed:" >&2
+  printf '%s\n' "$POLICY_FAULTS" | sed 's/^/       - /' >&2
+  echo "       Someone else wrote this key policy. Treat the key as compromised." >&2
+  echo "       Policy in force:" >&2
+  printf '%s' "$INSTALLED_POLICY" | jq -S . >&2
+  exit 1
+fi
+echo "Installed policy verified: Decrypt is PCR-gated to the instance role; PutKeyPolicy, Encrypt and CreateGrant are gone."
+
+# Check grants AFTER finalize: a pre-check races the plant, whereas the final policy has
+# already denied CreateGrant. Polled because CreateGrant is eventually consistent.
 echo "Verifying no grants were planted during the bootstrap window..."
 GRANTS=""
 for _ in 1 2 3 4 5 6; do

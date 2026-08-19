@@ -32,7 +32,7 @@ done
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 PROJECT_DIR="$( cd "$SCRIPT_DIR/../.." &> /dev/null && pwd )"
-cd "$PROJECT_DIR"
+cd "$PROJECT_DIR" || exit 1
 
 PACKAGE_NAME="raw-image"
 [ "$DEBUG" = true ] && PACKAGE_NAME="${PACKAGE_NAME}-debug"
@@ -41,7 +41,7 @@ PACKAGE_NAME="raw-image"
 if [ "$SECURE_BOOT" = true ]; then
   if [ ! -d "sb-keys" ]; then
     echo "Error: secure boot requested but sb-keys/ directory is missing."
-    echo "       start.sh should populate sb-keys/ with the key hierarchy."
+    echo "       build.sh should populate sb-keys/ with the key hierarchy."
     exit 1
   fi
   # db.key is only on disk when NOT fetched via --identity-arn
@@ -59,6 +59,7 @@ echo "Running Nix UKI build for package: $PACKAGE_NAME"
 nix --extra-experimental-features nix-command --extra-experimental-features flakes \
   build .#"$PACKAGE_NAME"
 
+# shellcheck disable=SC2181  # $? needed: multi-line nix command can't be wrapped in if-!
 if [ $? -ne 0 ]; then
   echo "Error: Nix UKI build failed"
   exit 1
@@ -110,6 +111,7 @@ else
     run .#create-ami -- result/nixos-tee_1.raw
 fi
 
+# shellcheck disable=SC2181  # $? needed: checks the last command in an if/else block above
 if [ $? -ne 0 ]; then
   echo "Error: UKI AMI creation failed"
   exit 1

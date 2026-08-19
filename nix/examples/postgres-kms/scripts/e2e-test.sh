@@ -2,12 +2,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-PROJECT_DIR="$( cd "$SCRIPT_DIR/.." &> /dev/null && pwd )"
 ARTIFACTS_DIR="$SCRIPT_DIR/../artifacts"
 RESOURCES_FILE="$ARTIFACTS_DIR/resources.json"
 
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=lib/identity.sh
 . "$SCRIPT_DIR/lib/identity.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib/roles.sh
+. "$SCRIPT_DIR/lib/roles.sh"
 
 SECURE_BOOT_FLAG=""
 DEBUG_FLAG=""
@@ -15,11 +18,16 @@ TIMEOUT=600
 NO_CLEANUP=false
 SKIP_SG_UPDATE=false
 AUTHORIZE_MY_IP=false
-ADMIN_ROLE_ARN_OVERRIDE=""
 VPC_ID_FLAG=""
 SECRET_MANAGER_FLAG=""
 IDENTITY_ARN=""
 START_PHASE=1
+CUSTODIAN_ROLE_ARN=""
+PROVISIONER_ROLE_ARN=""
+DEPLOYER_ROLE_ARN=""
+OPERATOR_ROLE_ARN=""
+TEST_CLIENT_ROLE_ARN=""
+CREATE_ROLES=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -29,7 +37,14 @@ while [[ $# -gt 0 ]]; do
     --no-cleanup) NO_CLEANUP=true; shift ;;
     --skip-sg-update) SKIP_SG_UPDATE=true; shift ;;
     --authorize-my-ip) AUTHORIZE_MY_IP=true; shift ;; # CI/CD: auto-allowlist the runner's public IP on 5432
-    --admin-role-arn) ADMIN_ROLE_ARN_OVERRIDE="$2"; shift; shift ;;
+    # Deprecated alias: the "admin" in 02a/02b is specifically the Custodian.
+    --admin-role-arn) CUSTODIAN_ROLE_ARN="$2"; shift; shift ;;
+    --custodian-role-arn) CUSTODIAN_ROLE_ARN="$2"; shift; shift ;;
+    --provisioner-role-arn) PROVISIONER_ROLE_ARN="$2"; shift; shift ;;
+    --deployer-role-arn) DEPLOYER_ROLE_ARN="$2"; shift; shift ;;
+    --operator-role-arn) OPERATOR_ROLE_ARN="$2"; shift; shift ;;
+    --test-client-role-arn) TEST_CLIENT_ROLE_ARN="$2"; shift; shift ;;
+    --create-roles) CREATE_ROLES=true; shift ;;
     --vpc-id) VPC_ID_FLAG="--vpc-id $2"; shift; shift ;;
     --start-phase) START_PHASE="$2"; shift; shift ;; # resume a prior --no-cleanup run
     --secrets-manager)
@@ -114,10 +129,9 @@ retrieve_client_certs() {
   fi
 
   local SECRET_JSON
-  SECRET_JSON=$(aws secretsmanager get-secret-value \
-    --secret-id "$SECRET_ARN" \
-    --query 'SecretString' \
-    --output text) || { echo "ERROR: Failed to retrieve secret from Secrets Manager"; return 1; }
+  SECRET_JSON=$(assume_role_exec "$TEST_CLIENT_ROLE_ARN" -- \
+    aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" \
+    --query 'SecretString' --output text) || { echo "ERROR: Failed to retrieve secret from Secrets Manager"; return 1; }
 
   local CA_B64 CERT_B64 KEY_B64
   CA_B64=$(echo "$SECRET_JSON" | jq -r '.ca_cert // empty')
@@ -269,7 +283,11 @@ cleanup() {
   fi
 
   if [ -f "$RESOURCES_FILE" ]; then
-    "$SCRIPT_DIR/clean.sh" && PHASE4_RESULT="PASS" || PHASE4_RESULT="FAIL"
+    CLEAN_ARGS=()
+    [ -n "$CUSTODIAN_ROLE_ARN" ] && CLEAN_ARGS+=(--custodian-role-arn "$CUSTODIAN_ROLE_ARN")
+    [ "$CREATE_ROLES" = true ] && CLEAN_ARGS+=(--delete-provisioning-roles)
+    "$SCRIPT_DIR/clean.sh" "${CLEAN_ARGS[@]+"${CLEAN_ARGS[@]}"}" \
+      && PHASE4_RESULT="PASS" || PHASE4_RESULT="FAIL"
   else
     echo "No resources file found, nothing to clean up."
     PHASE4_RESULT="PASS"
@@ -284,100 +302,120 @@ fi
 echo "AWS credentials are valid."
 
 phase1() {
-  # KMS key first: ARN is pinned into the image (PCR4). Bootstrap policy here; gated in Step 4.
-  echo "Step 1: Creating KMS key (bootstrap policy)..."
-  ADMIN_ROLE_ARN="${ADMIN_ROLE_ARN_OVERRIDE:-$(aws sts get-caller-identity --query 'Arn' --output text)}"
-  OUTPUT=$("$SCRIPT_DIR/steps/02a_create_kms_key.sh" -a "$ADMIN_ROLE_ARN")
+  # Stage order is not the old step order: instance-role creation moves first
+  # because KMS validates key-policy principals (lib/kms.sh retries on "invalid
+  # principals"), so the role must exist before stage 5.
+  if [ "$CREATE_ROLES" = true ]; then
+    echo "Stage 0: Creating the five provisioning roles..."
+    OUTPUT=$("$SCRIPT_DIR/steps/00_create_roles.sh") || { echo "Role creation failed"; return 1; }
+    CUSTODIAN_ROLE_ARN=$(echo "$OUTPUT" | grep -oP 'CUSTODIAN_ROLE_ARN: \K.*')
+    PROVISIONER_ROLE_ARN=$(echo "$OUTPUT" | grep -oP 'PROVISIONER_ROLE_ARN: \K.*')
+    DEPLOYER_ROLE_ARN=$(echo "$OUTPUT" | grep -oP 'DEPLOYER_ROLE_ARN: \K.*')
+    OPERATOR_ROLE_ARN=$(echo "$OUTPUT" | grep -oP 'OPERATOR_ROLE_ARN: \K.*')
+    TEST_CLIENT_ROLE_ARN=$(echo "$OUTPUT" | grep -oP 'TEST_CLIENT_ROLE_ARN: \K.*')
+    for VAR in CUSTODIAN_ROLE_ARN PROVISIONER_ROLE_ARN DEPLOYER_ROLE_ARN OPERATOR_ROLE_ARN TEST_CLIENT_ROLE_ARN; do
+      [ -n "${!VAR}" ] || { echo "Failed to extract $VAR"; return 1; }
+    done
+    # IAM is eventually consistent: a role can exist before it is assumable.
+    echo "Waiting 10s for IAM role propagation..."
+    sleep 10
+  fi
+
+  # Persisted so clean.sh can schedule key deletion as the Custodian (it reads
+  # CUSTODIAN_ROLE_ARN directly from resources.json). Other role ARNs are NOT read
+  # back on --start-phase resume: they fall back to ambient credentials via
+  # assume_role_exec's empty-ARN passthrough.
+  [ -n "$CUSTODIAN_ROLE_ARN" ] && update_resource "CUSTODIAN_ROLE_ARN" "$CUSTODIAN_ROLE_ARN"
+  [ -n "$PROVISIONER_ROLE_ARN" ] && update_resource "PROVISIONER_ROLE_ARN" "$PROVISIONER_ROLE_ARN"
+  [ -n "$DEPLOYER_ROLE_ARN" ] && update_resource "DEPLOYER_ROLE_ARN" "$DEPLOYER_ROLE_ARN"
+  [ -n "$OPERATOR_ROLE_ARN" ] && update_resource "OPERATOR_ROLE_ARN" "$OPERATOR_ROLE_ARN"
+  [ -n "$TEST_CLIENT_ROLE_ARN" ] && update_resource "TEST_CLIENT_ROLE_ARN" "$TEST_CLIENT_ROLE_ARN"
+
+  echo "Stage 1/6 (Operator): instance role and profile..."
+  ROLE_NAME="TpmAttestationRole"
+  INSTANCE_PROFILE_NAME="TpmAttestationProfile"
+  # shellcheck disable=SC2086  # ${VAR:+...} and DEBUG_FLAG unquoted for word-splitting into separate args
+  OUTPUT=$("$SCRIPT_DIR/prepare-role.sh" \
+    ${OPERATOR_ROLE_ARN:+--operator-role-arn "$OPERATOR_ROLE_ARN"} \
+    -r "$ROLE_NAME" -p "$INSTANCE_PROFILE_NAME" $DEBUG_FLAG) \
+    || { echo "Stage 1 failed"; return 1; }
+  INSTANCE_ROLE_ARN=$(echo "$OUTPUT" | grep -oP 'INSTANCE_ROLE_ARN: \K.*')
+  [ -z "$INSTANCE_ROLE_ARN" ] && { echo "Failed to extract INSTANCE_ROLE_ARN"; return 1; }
+  update_resource "ROLE_NAME" "$ROLE_NAME"
+  update_resource "INSTANCE_PROFILE_NAME" "$INSTANCE_PROFILE_NAME"
+  echo "Instance role: $INSTANCE_ROLE_ARN"
+
+  echo "Stage 2/6 (Custodian): KMS key under the bootstrap policy..."
+  # shellcheck disable=SC2086  # ${VAR:+...} expansions unquoted for word-splitting into separate args
+  OUTPUT=$("$SCRIPT_DIR/create-key.sh" \
+    ${CUSTODIAN_ROLE_ARN:+--custodian-role-arn "$CUSTODIAN_ROLE_ARN"} \
+    ${PROVISIONER_ROLE_ARN:+--provisioner-role-arn "$PROVISIONER_ROLE_ARN"}) \
+    || { echo "Stage 2 failed"; return 1; }
   KMS_KEY_ARN=$(echo "$OUTPUT" | grep -oP 'KMS key created with ARN: \K.*')
   [ -z "$KMS_KEY_ARN" ] && { echo "Failed to extract KMS key ARN"; return 1; }
   update_resource "KMS_KEY_ARN" "$KMS_KEY_ARN"
   echo "KMS Key ARN: $KMS_KEY_ARN"
 
-  echo "Step 2: Creating AMI..."
-  CREATE_AMI_ARGS="$SECURE_BOOT_FLAG $DEBUG_FLAG"
+  echo "Stage 3/6 (Deployer): pin, build, sign, register..."
+  BUILD_ARGS=(--key-id "$KMS_KEY_ARN" -y)
+  [ -n "$DEPLOYER_ROLE_ARN" ] && BUILD_ARGS+=(--deployer-role-arn "$DEPLOYER_ROLE_ARN")
+  [ -n "$SECURE_BOOT_FLAG" ] && BUILD_ARGS+=("$SECURE_BOOT_FLAG")
+  [ -n "$DEBUG_FLAG" ] && BUILD_ARGS+=("$DEBUG_FLAG")
   if [ -n "$SECRET_MANAGER_FLAG" ]; then
-    if [ -z "$IDENTITY_ARN" ]; then
-      echo "Generating and uploading a golden signing identity..."
-      IDENTITY_ARN=$(generate_and_upload_identity "nitrotpm-sb-identity") \
-        || { echo "Failed to generate signing identity"; return 1; }
-      update_resource "IDENTITY_ARN" "$IDENTITY_ARN"
-      echo "Identity uploaded (no private key written to disk). ARN: $IDENTITY_ARN"
+    if [ -n "$IDENTITY_ARN" ]; then
+      BUILD_ARGS+=(--secrets-manager "$IDENTITY_ARN")
+    else
+      BUILD_ARGS+=(--secrets-manager)
     fi
-    echo "Rebuilding reproducible UEFI envelope from persisted identity..."
-    rebuild_sb_envelope_from_identity "$PROJECT_DIR/sb-keys" "$PROJECT_DIR" "$IDENTITY_ARN" \
-      || { echo "Failed to rebuild secure boot envelope"; return 1; }
-    CREATE_AMI_ARGS="$CREATE_AMI_ARGS --identity-arn $IDENTITY_ARN"
-  elif [ -n "$SECURE_BOOT_FLAG" ]; then
-    echo "Generating ephemeral secure boot keys (non-reproducible)..."
-    generate_local_sb_keys "$PROJECT_DIR/sb-keys" "$PROJECT_DIR" \
-      || { echo "Failed to generate secure boot keys"; return 1; }
   fi
-  OUTPUT=$("$SCRIPT_DIR/steps/00_create_ami.sh" $CREATE_AMI_ARGS)
-  CREATE_AMI_RC=$?
-  if [ -n "$SECURE_BOOT_FLAG" ] && [ -d "$PROJECT_DIR/sb-keys" ]; then
-    rm -rf "$PROJECT_DIR/sb-keys"
-  fi
-  [ $CREATE_AMI_RC -ne 0 ] && { echo "AMI creation failed"; return 1; }
-  AMI_ID=$(echo "$OUTPUT" | grep -oP 'ami-[a-z0-9]+')
+  OUTPUT=$("$SCRIPT_DIR/build.sh" "${BUILD_ARGS[@]}") || { echo "Stage 3 failed"; return 1; }
+  AMI_ID=$(echo "$OUTPUT" | grep -oP 'AMI_ID: \K.*')
+  PCR_DIR=$(echo "$OUTPUT" | grep -oP 'PCR_DIR: \K.*')
+  IDENTITY_ARN=$(echo "$OUTPUT" | grep -oP 'IDENTITY_ARN: \K.*' || true)
   [ -z "$AMI_ID" ] && { echo "Failed to extract AMI ID"; return 1; }
+  [ -z "$PCR_DIR" ] && { echo "Failed to extract PCR_DIR"; return 1; }
   update_resource "AMI_ID" "$AMI_ID"
-  echo "AMI ID: $AMI_ID"
+  [ -n "$IDENTITY_ARN" ] && update_resource "IDENTITY_ARN" "$IDENTITY_ARN"
+  echo "AMI ID: $AMI_ID (PCRs in $PCR_DIR)"
 
-  echo "Step 3: Setting up IAM..."
-  ROLE_NAME="TpmAttestationRole"
-  INSTANCE_PROFILE_NAME="TpmAttestationProfile"
-  if [ -n "$DEBUG_FLAG" ]; then
-    "$SCRIPT_DIR/steps/01_create_instance_profile.sh" -r "$ROLE_NAME" -p "$INSTANCE_PROFILE_NAME" --debug
-  else
-    "$SCRIPT_DIR/steps/01_create_instance_profile.sh" -r "$ROLE_NAME" -p "$INSTANCE_PROFILE_NAME"
+  echo "Stage 4/6 (Provisioner): wrap the DEK, issue certificates..."
+  # shellcheck disable=SC2086  # ${VAR:+...} expansion unquoted for word-splitting into separate args
+  OUTPUT=$("$SCRIPT_DIR/provision-secrets.sh" --key-id "$KMS_KEY_ARN" \
+    ${PROVISIONER_ROLE_ARN:+--provisioner-role-arn "$PROVISIONER_ROLE_ARN"}) \
+    || { echo "Stage 4 failed"; return 1; }
+  SECRET_ARN=$(echo "$OUTPUT" | grep -oP 'SECRET_ARN: \K.*')
+  [ -z "$SECRET_ARN" ] && { echo "Failed to extract SECRET_ARN"; return 1; }
+  update_resource "SECRET_ARN" "$SECRET_ARN"
+
+  echo "Stage 5/6 (Custodian): gate Decrypt on the PCRs, revoke Encrypt..."
+  # Unsigned runs have no PCR7, and finalize-key.sh refuses that gate unless asked by name.
+  FINALIZE_ARGS=(--key-id "$KMS_KEY_ARN" --instance-role-arn "$INSTANCE_ROLE_ARN" --pcr-dir "$PCR_DIR")
+  [ -n "$CUSTODIAN_ROLE_ARN" ] && FINALIZE_ARGS+=(--custodian-role-arn "$CUSTODIAN_ROLE_ARN")
+  [ -z "$SECURE_BOOT_FLAG" ] && FINALIZE_ARGS+=(--allow-pcr4-only)
+  "$SCRIPT_DIR/finalize-key.sh" "${FINALIZE_ARGS[@]}" \
+    || { echo "Stage 5 failed"; return 1; }
+
+  echo "Stage 6/6 (Operator): volume, launch, security group..."
+  DEPLOY_ARGS=(--ami-id "$AMI_ID" --instance-profile "$INSTANCE_PROFILE_NAME")
+  [ -n "$OPERATOR_ROLE_ARN" ] && DEPLOY_ARGS+=(--operator-role-arn "$OPERATOR_ROLE_ARN")
+  if [ -n "$VPC_ID_FLAG" ]; then
+    # shellcheck disable=SC2206  # VPC_ID_FLAG is "--vpc-id X" and must word-split into two args
+    DEPLOY_ARGS+=($VPC_ID_FLAG)
   fi
-  update_resource "ROLE_NAME" "$ROLE_NAME"
-  update_resource "INSTANCE_PROFILE_NAME" "$INSTANCE_PROFILE_NAME"
-
-  # Wrap the DEK while the bootstrap policy still grants Encrypt, BEFORE finalize strips it.
-  echo "Step 4: Creating symmetric key..."
-  local KEY_TMPDIR
-  KEY_TMPDIR=$(mktemp -d)
-  chmod 700 "$KEY_TMPDIR"
-  local KEY_FILE="$KEY_TMPDIR/symmetric_key"
-  "$SCRIPT_DIR/steps/03_create_symmetric_key.sh" -k "$KMS_KEY_ARN" --plaintext-key-out "$KEY_FILE" \
-    || { rm -rf "$KEY_TMPDIR"; return 1; }
-
-  # Real policy: Decrypt gated on PCRs; kms:PutKeyPolicy and kms:Encrypt revoked, key immutable from here.
-  echo "Step 5: Finalizing KMS key policy with PCR conditions..."
-  INSTANCE_ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
-  PCR_DIR=$(resolve_pcr_dir "$SCRIPT_DIR/.." "$SECURE_BOOT_FLAG")
-  "$SCRIPT_DIR/steps/02b_finalize_kms_policy.sh" -k "$KMS_KEY_ARN" -r "$INSTANCE_ROLE_ARN" -a "$ADMIN_ROLE_ARN" -m "$PCR_DIR" \
-    || { rm -rf "$KEY_TMPDIR"; echo "Failed to finalize KMS key policy"; return 1; }
-
-  echo "Step 6: Creating certificates..."
-  "$SCRIPT_DIR/steps/05a_create_certificates.sh" --symmetric-key "$KEY_FILE" \
-    || { rm -rf "$KEY_TMPDIR"; return 1; }
-  rm -rf "$KEY_TMPDIR"
-
-  echo "Step 7: Creating EBS volume..."
-  AVAILABILITY_ZONE=$(aws ec2 describe-availability-zones --query 'AvailabilityZones[0].ZoneName' --output text)
-  OUTPUT=$("$SCRIPT_DIR/steps/04_create_ebs_volume.sh" -z "$AVAILABILITY_ZONE")
-  VOLUME_ID=$(echo "$OUTPUT" | grep -oP 'Volume ID: \K.*')
-  [ -z "$VOLUME_ID" ] && { echo "Failed to extract Volume ID"; return 1; }
+  [ -n "$DEBUG_FLAG" ] && DEPLOY_ARGS+=("$DEBUG_FLAG")
+  [ "$AUTHORIZE_MY_IP" = true ] && DEPLOY_ARGS+=(--authorize-my-ip)
+  OUTPUT=$("$SCRIPT_DIR/deploy.sh" "${DEPLOY_ARGS[@]}") || { echo "Stage 6 failed"; return 1; }
+  VOLUME_ID=$(echo "$OUTPUT" | grep -oP 'VOLUME_ID: \K.*')
+  INSTANCE_ID=$(echo "$OUTPUT" | grep -oP 'INSTANCE_ID: \K.*')
+  PRIVATE_IP=$(echo "$OUTPUT" | grep -oP 'PRIVATE_IP: \K.*')
+  PUBLIC_IP=$(echo "$OUTPUT" | grep -oP 'PUBLIC_IP: \K.*')
+  SG_ID=$(echo "$OUTPUT" | grep -oP 'SECURITY_GROUP_ID: \K.*')
+  { [ -z "$INSTANCE_ID" ] || [ -z "$PUBLIC_IP" ] || [ -z "$SG_ID" ] || [ -z "$VOLUME_ID" ]; } \
+    && { echo "Failed to extract instance details"; return 1; }
   update_resource "VOLUME_ID" "$VOLUME_ID"
-  echo "Volume ID: $VOLUME_ID"
-
-  echo "Step 8: Launching instance..."
-  OUTPUT=$(run_instance_step "$AMI_ID" "$INSTANCE_PROFILE_NAME" "$VOLUME_ID" "$VPC_ID_FLAG" "$DEBUG_FLAG")
-  INSTANCE_ID=$(echo "$OUTPUT" | grep -oP 'Instance ID: \K.*')
-  PRIVATE_IP=$(echo "$OUTPUT" | grep -oP 'Private IP: \K.*')
-  PUBLIC_IP=$(echo "$OUTPUT" | grep -oP 'Public IP: \K.*')
-  SG_ID=$(echo "$OUTPUT" | grep -oP 'Security Group ID: \K.*')
-  [ -z "$INSTANCE_ID" ] || [ -z "$PUBLIC_IP" ] || [ -z "$SG_ID" ] && { echo "Failed to extract instance details"; return 1; }
   update_resource "INSTANCE_ID" "$INSTANCE_ID"
   update_resource "SECURITY_GROUP_ID" "$SG_ID"
   echo "Instance ID: $INSTANCE_ID, Private IP: $PRIVATE_IP, Public IP: $PUBLIC_IP"
-  if [ "$AUTHORIZE_MY_IP" = true ]; then
-    authorize_my_ip "$SG_ID" || return 1
-  elif [ "$SKIP_SG_UPDATE" = false ]; then
-    print_sg_authorization_notice "$SG_ID"
-  fi
 }
 
 if [ "$START_PHASE" -le 1 ]; then

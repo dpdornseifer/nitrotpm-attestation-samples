@@ -1,10 +1,14 @@
 #!/bin/bash
 #
-# Shared helpers (functions only) sourced by start.sh and e2e-test.sh.
+# Shared helpers (functions only) sourced by the ceremony stages and e2e-test.sh.
 #
 # The xtrace-suppression idiom in the secret-handling helpers is inlined on purpose:
 # a RETURN trap fires when the installing function returns, so a shared helper would
 # re-enable xtrace in the caller and leak key material.
+
+# Resolved from this file's own location: deploy.sh sources it in an assume_role_exec
+# subshell where the caller's $SCRIPT_DIR is absent.
+IDENTITY_SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
 
 # Validate the Secrets Manager ARN format; exits on mismatch.
 validate_secret_arn() {
@@ -73,6 +77,7 @@ update_resource() {
   local VALUE=$2
   local tmp
   tmp=$(mktemp "${RESOURCES_FILE}.XXXXXX")
+  # shellcheck disable=SC2015  # A&&B||C is intentional: rm tmp only on failure
   jq --arg key "$KEY" --arg value "$VALUE" '.[$key] = $value' "$RESOURCES_FILE" > "$tmp" && mv "$tmp" "$RESOURCES_FILE" || rm -f "$tmp"
 }
 
@@ -88,17 +93,19 @@ resolve_pcr_dir() {
 }
 
 # Launch an instance via step 05 with the standard arg set (single source of truth for
-# start.sh and e2e-test.sh). vpc_id_flag/debug_flag are passed unquoted so a two-word
-# "--vpc-id X" splits into two args and an empty flag vanishes. Uses $SCRIPT_DIR (caller's
-# global). Args: <ami_id> <instance_profile> <volume_id> [vpc_id_flag] [debug_flag].
+# deploy.sh and e2e-test.sh). vpc_id_flag/debug_flag are passed unquoted so a two-word
+# "--vpc-id X" splits into two args and an empty flag vanishes.
+# Args: <ami_id> <instance_profile> <volume_id> [vpc_id_flag] [debug_flag].
 run_instance_step() {
   local ami_id="$1" instance_profile="$2" volume_id="$3" vpc_id_flag="${4:-}" debug_flag="${5:-}"
-  "$SCRIPT_DIR/steps/05_run_instance.sh" -a "$ami_id" -p "$instance_profile" -v "$volume_id" $vpc_id_flag $debug_flag
+  # shellcheck disable=SC2086  # vpc_id_flag/debug_flag intentionally unquoted for word-splitting
+  "$IDENTITY_SCRIPTS_DIR/steps/05_run_instance.sh" -a "$ami_id" -p "$instance_profile" -v "$volume_id" $vpc_id_flag $debug_flag
 }
 
 # Generate the golden identity in memory and emit it as JSON on stdout:
 # {guid, db_key, db_crt, pk_crt, kek_crt}. No private key touches disk.
 generate_identity_material() {
+  # shellcheck disable=SC2016  # single-quoted heredoc-style arg: expansions run in the inner bash
   nix --extra-experimental-features nix-command --extra-experimental-features flakes shell \
     nixpkgs#openssl nixpkgs#util-linux nixpkgs#jq --command bash -c '
     set -euo pipefail
@@ -107,9 +114,10 @@ generate_identity_material() {
     kek_crt=$(openssl req -newkey rsa:4096 -nodes -keyout /dev/null -new -x509 -sha256 -days 3650 -subj "/CN=Key Exchange Key/" 2>/dev/null)
     db_key=$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 2>/dev/null)
     db_crt=$(printf "%s" "$db_key" | openssl req -new -x509 -sha256 -days 3650 -subj "/CN=Signature Database key/" -key /dev/stdin 2>/dev/null)
-    jq -n --arg guid "$guid" --arg db_key "$db_key" --arg db_crt "$db_crt" \
+    # db_key via the environment, not --arg: /proc/<pid>/cmdline is world-readable.
+    db_key="$db_key" jq -n --arg guid "$guid" --arg db_crt "$db_crt" \
           --arg pk_crt "$pk_crt" --arg kek_crt "$kek_crt" \
-          "{guid: \$guid, db_key: \$db_key, db_crt: \$db_crt, pk_crt: \$pk_crt, kek_crt: \$kek_crt}"
+          "{guid: \$guid, db_key: \$ENV.db_key, db_crt: \$db_crt, pk_crt: \$pk_crt, kek_crt: \$kek_crt}"
   '
 }
 
@@ -125,6 +133,7 @@ generate_local_sb_keys() {
   nix --extra-experimental-features nix-command --extra-experimental-features flakes shell \
     nixpkgs#openssl nixpkgs#efitools nixpkgs#util-linux --command bash -c "
     set -euo pipefail
+    umask 077
     cd '$key_dir'
 
     uuidgen --random > GUID.txt
@@ -152,24 +161,105 @@ generate_local_sb_keys() {
   chmod 0600 "$key_dir/PK.key" "$key_dir/KEK.key" "$key_dir/db.key"
 }
 
+# Deny GetSecretValue to every principal except the Deployer.
+#
+# Must be a Deny: Secrets Manager grants access if EITHER the identity policy or the
+# resource policy allows, so an Allow-only policy would leave any principal holding
+# secretsmanager:GetSecretValue able to read the signing key, sign a rogue image and
+# — if it also runs finalize-key — gate Decrypt to those rogue PCRs single-handedly.
+#
+# Scoped to GetSecretValue alone: a blanket secretsmanager:* Deny would also block
+# DeleteSecret and break teardown (clean.sh:58-61 deletes this secret).
+#
+# ArnNotEquals because AWS recommends ARN operators for ARN comparisons, and
+# aws:PrincipalArn evaluates to the IAM role ARN — never the assumed-role session
+# ARN. Args: <deployer_role_arn>.
+build_identity_resource_policy() {
+  local deployer="$1"
+  cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyGetSecretValueExceptDeployer",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "*",
+      "Condition": {
+        "ArnNotEquals": {
+          "aws:PrincipalArn": "${deployer}"
+        }
+      }
+    }
+  ]
+}
+EOF
+}
+
+# Attach the Deployer-only read policy to a secret and verify it landed.
+# create-secret cannot attach a resource policy atomically, so there is an
+# unavoidable create->attach window; verifying afterwards is what closes it, the
+# same shape as 02b's post-finalize grant audit. Fails closed.
+# Args: <secret_arn> <deployer_role_arn>.
+lock_secret_to_deployer() {
+  local arn="$1" deployer="${2:-}" policy readback
+
+  if [ -z "$deployer" ]; then
+    echo -e "\033[33m⚠️  WARNING: no --deployer-role-arn supplied.\033[0m" >&2
+    echo -e "\033[33m   Signing identity $arn has NO resource policy Deny: it is readable by any principal\033[0m" >&2
+    echo -e "\033[33m   holding secretsmanager:GetSecretValue. That principal could sign a rogue image\033[0m" >&2
+    echo -e "\033[33m   and gate kms:Decrypt to those rogue PCRs — defeating the Deployer≠Custodian split.\033[0m" >&2
+    echo -e "\033[33m   To lock the secret: --deployer-role-arn <DEPLOYER_ROLE_ARN>\033[0m" >&2
+    return 0
+  fi
+
+  policy=$(build_identity_resource_policy "$deployer")
+  if ! aws secretsmanager put-resource-policy \
+        --secret-id "$arn" \
+        --resource-policy "$policy" >/dev/null 2>&1; then
+    echo "Error: failed to attach the Deployer-only resource policy to $arn" >&2
+    return 1
+  fi
+
+  readback=$(aws secretsmanager get-resource-policy --secret-id "$arn" \
+    --query 'ResourcePolicy' --output text 2>/dev/null) || readback=""
+  if ! printf '%s' "$readback" | jq -e --arg deployer "$deployer" \
+      '[.Statement[]
+        | select(.Effect == "Deny")
+        | select(.Action == "secretsmanager:GetSecretValue")
+        | select(.Condition.ArnNotEquals["aws:PrincipalArn"] == $deployer)]
+       | length == 1' >/dev/null 2>&1; then
+    echo "Error: resource policy on $arn did not read back as expected; failing closed." >&2
+    return 1
+  fi
+
+  echo "Signing identity $arn locked to $deployer." >&2
+}
+
 # Create a Secrets Manager secret from a file path (typically a process
-# substitution so the value never hits disk). Prints the ARN. Args: <name> <src-path>.
+# substitution so the value never hits disk). Prints the ARN. When a Deployer ARN
+# is given, attaches and verifies the Deployer-only read policy before returning.
+# Args: <name> <src-path> [deployer_role_arn].
 upload_secret() {
-  local name="$1" src="$2"
-  aws secretsmanager create-secret \
+  local name="$1" src="$2" deployer="${3:-}" arn
+  arn=$(aws secretsmanager create-secret \
     --name "$name" \
     --secret-string "file://$src" \
-    --query 'ARN' --output text
+    --query 'ARN' --output text) || return 1
+
+  lock_secret_to_deployer "$arn" "$deployer" || return 1
+  printf '%s\n' "$arn"
 }
 
 # Generate a fresh golden identity in memory and upload it as one JSON secret.
 # Persisting the full identity keeps ESL inputs byte-stable so PCR7 is reproducible.
-# Prints the secret ARN. Args: <name_prefix>.
+# Prints the secret ARN. Args: <name_prefix> [deployer_role_arn].
 generate_and_upload_identity() {
   # Suppress xtrace: identity_json carries the db private key
   case "$-" in *x*) trap 'set -x; trap - RETURN' RETURN; set +x ;; esac
 
-  local name_prefix="$1"
+  local name_prefix="$1" deployer="${2:-}"
   local ts identity_json arn
   ts=$(date +%s)
 
@@ -188,7 +278,7 @@ generate_and_upload_identity() {
     return 1
   fi
 
-  arn=$(upload_secret "${name_prefix}-${ts}" <(printf '%s' "$identity_json")) || arn=""
+  arn=$(upload_secret "${name_prefix}-${ts}" <(printf '%s' "$identity_json") "$deployer") || arn=""
   unset identity_json
   if [ -z "$arn" ]; then
     echo "Error: Failed to upload identity to Secrets Manager" >&2

@@ -49,6 +49,34 @@
   services.sshd.enable = lib.mkForce false;
   services.udisks2.enable = false; # udisks has become too bloated to have in a headless system
 
+  # An operator-attached EBS volume is auto-probed as root by udev, and pvscan parses its
+  # metadata. Do NOT disable services.lvm to stop that: lvm2 also ships the generic
+  # device-mapper udev rules, and without 95-dm-notify libdevmapper's cookie is never
+  # released (luksFormat hangs until its timeout) and without 13-dm-disk there is no
+  # /dev/mapper/data for data.mount. Reject every device for LVM tools instead.
+  environment.etc."lvm/lvm.conf".text = lib.mkAfter ''
+    devices { global_filter = [ "r|.*|" ] }
+  '';
+
+  # Subsystems nothing here uses, carrying unpatched CVEs in the floating kernel.
+  # dm_mod is deliberately absent: dm-crypt and dm-verity depend on it.
+  boot.blacklistedKernelModules = [
+    "bcache" # parses attacker-supplied journal metadata on udev auto-registration
+    "sctp"
+    "openvswitch"
+    "can"
+    "can-raw"
+    "can-bcm"
+    "can-gw"
+    "can-j1939"
+    "vcan"
+    "mpls_router"
+    "mpls_iptunnel"
+  ];
+
+  # MPTCP is built into the TCP stack, so a blocklist entry cannot reach it.
+  boot.kernel.sysctl."net.mptcp.enabled" = 0;
+
   system.disableInstallerTools = lib.mkDefault true;
   system.switch.enable = lib.mkDefault false;
 

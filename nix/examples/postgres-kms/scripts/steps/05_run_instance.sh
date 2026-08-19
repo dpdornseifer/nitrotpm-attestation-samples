@@ -15,7 +15,6 @@ usage() {
 }
 
 SECURITY_GROUP_NAME="PostgresKMS-TestSG"
-DEBUG=false
 VPC_ID=""
 
 while [[ "$#" -gt 0 ]]; do
@@ -25,7 +24,7 @@ while [[ "$#" -gt 0 ]]; do
     -v|--volume-id) VOLUME_ID="$2"; shift ;;
     -t|--instance-type) INSTANCE_TYPE="$2"; shift ;;
     --vpc-id) VPC_ID="$2"; shift ;;
-    --debug) DEBUG=true ;;
+    --debug) : ;;  # accepted for compat with callers; instance launch is identical either way
     *) usage ;;
   esac
   shift

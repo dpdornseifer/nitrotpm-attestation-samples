@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2317  # helper functions are called indirectly (trap / run_step)
 #
 # Tests reproducibility of the postgres-kms image builds.
 #
@@ -19,7 +20,23 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 PROJECT_DIR="$( cd "$SCRIPT_DIR/.." &> /dev/null && pwd )"
 TEST_DIR="$PROJECT_DIR/.test-repro"
 
+# Nothing here needs root, and a single-user nix store belongs to the installing user:
+# building as root writes root-owned paths into it, which breaks later unprivileged builds.
+# A daemon install keeps /nix/store root-owned, so only refuse the single-user case.
+if [ "$(id -u)" -eq 0 ] && [ "$(stat -c %U /nix/store 2>/dev/null)" != "root" ]; then
+  echo "Error: refusing to build as root against a single-user /nix/store." >&2
+  echo "       No test in this script needs root. Rerun without sudo." >&2
+  exit 1
+fi
+
+# A non-login shell (ssh 'cmd', a script) does not source the nix profile, so the bare
+# `nix` calls below would be "command not found" despite nix being installed.
+if ! command -v nix >/dev/null 2>&1 && [ -x "$HOME/.nix-profile/bin/nix" ]; then
+  PATH="$HOME/.nix-profile/bin:$PATH"
+fi
+
 # shellcheck source=lib/identity.sh
+# shellcheck disable=SC1091  # sourced at runtime; path is relative to $SCRIPT_DIR
 . "$SCRIPT_DIR/lib/identity.sh"
 
 GREEN="\033[32m"
@@ -38,6 +55,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# shellcheck disable=SC2317  # called via trap
 cleanup() {
   rm -rf "$TEST_DIR"
 }
@@ -162,7 +180,7 @@ sign_and_compute_pcrs() {
 
 # ------------------------------------------------------------------------
 
-cd "$PROJECT_DIR"
+cd "$PROJECT_DIR" || exit 1
 
 NIX="nix --extra-experimental-features nix-command --extra-experimental-features flakes"
 PACKAGE="raw-image"
@@ -179,7 +197,9 @@ echo " Test 1: PCR4 reproducibility (two nix builds)"
 echo "         EXPECT: PCR4 identical"
 echo "----------------------------------------------------"
 
+# shellcheck disable=SC2086  # $NIX is a multi-word command prefix; intentional word-splitting
 run_step "Build A" $NIX build .#"$PACKAGE" --out-link "$TEST_DIR/result-a"
+# shellcheck disable=SC2086
 run_step "Build B (--rebuild)" $NIX build .#"$PACKAGE" --rebuild --out-link "$TEST_DIR/result-b"
 
 PCR_A="$TEST_DIR/result-a/tpm_pcr.json"

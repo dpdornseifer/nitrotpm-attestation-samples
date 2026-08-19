@@ -22,9 +22,12 @@ CREDS=$(curl -s -f -H "X-aws-ec2-metadata-token: $TOKEN" \
   exit 1
 }
 
-export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)
-export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)
-export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .Token)
+AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)
+export AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)
+export AWS_SECRET_ACCESS_KEY
+AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .Token)
+export AWS_SESSION_TOKEN
 
 echo "Credentials refreshed for role: $ROLE"
 echo "Expiration: $(echo "$CREDS" | jq -r .Expiration)"

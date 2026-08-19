@@ -18,6 +18,14 @@ LUKS_EXPECTED_INTEGRITY="hmac(sha256)"
 # 4096 gives dm-integrity write atomicity and matches PostgreSQL's 8 KiB pages.
 LUKS_EXPECTED_SECTOR_SIZE="4096"
 
+# Passed to luksFormat as well as asserted, so a future cryptsetup default cannot format
+# one way and be rejected on the next boot.
+# shellcheck disable=SC2034  # consumed by luks-init.nix, which sources this file
+LUKS_EXPECTED_PBKDF="argon2id"
+
+# LUKS2 JSON states the combined enc+integrity key in BYTES, not bits.
+LUKS_EXPECTED_KEYSLOT_BYTES=$(( (LUKS_EXPECTED_KEYSIZE + LUKS_EXPECTED_INTEGRITY_KEYSIZE) / 8 ))
+
 # Overridable: image injects a store path, tests use $PATH.
 : "${LUKS_JQ:=jq}"
 
@@ -57,18 +65,33 @@ luks_verify_header_json() {
   out=$(printf '%s' "$meta" | "$LUKS_JQ" -e \
     --arg cipher "$LUKS_EXPECTED_CIPHER" \
     --arg integrity "$LUKS_EXPECTED_INTEGRITY" \
-    --arg sector_size "$LUKS_EXPECTED_SECTOR_SIZE" '
+    --arg sector_size "$LUKS_EXPECTED_SECTOR_SIZE" \
+    --arg pbkdf "$LUKS_EXPECTED_PBKDF" \
+    --arg keyslot_bytes "$LUKS_EXPECTED_KEYSLOT_BYTES" '
       (.segments | length) == 1
       and .segments["0"].type == "crypt"
       and .segments["0"].encryption == $cipher
       and (.segments["0"].sector_size | tostring) == $sector_size
       and (.segments["0"].integrity.type // "") == $integrity
+
+      # Keyslots, digests and tokens are all alternative ways in, so a segments-only
+      # check left slot 0 rewritable with a short key and a second slot appendable.
+      and (.keyslots | length) == 1
+      and .keyslots["0"].type == "luks2"
+      and (.keyslots["0"].key_size | tostring) == $keyslot_bytes
+      and .keyslots["0"].kdf.type == $pbkdf
+      and (.digests | length) == 1
+      and .digests["0"].keyslots == ["0"]
+      and .digests["0"].segments == ["0"]
+      and ((.tokens // {}) | length) == 0
     ' 2>&1) || rc=$?
 
   if [ "$rc" -ne 0 ]; then
     echo "luks-verify: header does not match the pinned format" \
          "(cipher=$LUKS_EXPECTED_CIPHER integrity=$LUKS_EXPECTED_INTEGRITY" \
-         "sector_size=$LUKS_EXPECTED_SECTOR_SIZE): ${out:-no output}" >&2
+         "sector_size=$LUKS_EXPECTED_SECTOR_SIZE kdf=$LUKS_EXPECTED_PBKDF" \
+         "keyslot_key_bytes=$LUKS_EXPECTED_KEYSLOT_BYTES, one keyslot/digest," \
+         "no tokens): ${out:-no output}" >&2
     return 1
   fi
   return 0
@@ -76,7 +99,7 @@ luks_verify_header_json() {
 
 # luks_verify_status <cryptsetup status output> -- authoritative check; luksOpen only proves key correctness.
 luks_verify_status() {
-  local text=$1 cipher keysize integrity expected_total
+  local text=$1 cipher keysize integrity sector_size expected_total
 
   cipher=$(_luks_status_field "$text" cipher) \
     || { echo "luks-verify: no cipher in mapping status" >&2; return 1; }
@@ -101,6 +124,15 @@ luks_verify_status() {
   if [ "${keysize%%[![:digit:]]*}" != "$expected_total" ]; then
     echo "luks-verify: active keysize '$keysize' != $expected_total bits" \
          "($LUKS_EXPECTED_KEYSIZE encryption + $LUKS_EXPECTED_INTEGRITY_KEYSIZE integrity)" >&2
+    return 1
+  fi
+
+  # Re-checked here, not just pre-open: a header rewritten between luksDump and luksOpen
+  # could otherwise activate at a different size. Leading integer only — units vary.
+  sector_size=$(_luks_status_field "$text" "sector size") \
+    || { echo "luks-verify: no sector size in mapping status" >&2; return 1; }
+  if [ "${sector_size%%[![:digit:]]*}" != "$LUKS_EXPECTED_SECTOR_SIZE" ]; then
+    echo "luks-verify: active sector size '$sector_size' != $LUKS_EXPECTED_SECTOR_SIZE" >&2
     return 1
   fi
 

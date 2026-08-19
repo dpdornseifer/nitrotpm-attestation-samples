@@ -8,7 +8,6 @@ pkgs.writeScript "luks-init.sh" ''
 
   CRYPTSETUP=${pkgs.cryptsetup}/bin/cryptsetup
 
-  # Sourced from the store (dm-verity / PCR4); provides luks_verify_header_json and luks_verify_status.
   LUKS_JQ=${pkgs.jq}/bin/jq
   . ${./luks-verify.sh}
 
@@ -54,6 +53,7 @@ pkgs.writeScript "luks-init.sh" ''
       --key-size "$LUKS_EXPECTED_KEYSIZE" \
       --integrity "$LUKS_EXPECTED_INTEGRITY_ARG" \
       --sector-size "$LUKS_EXPECTED_SECTOR_SIZE" \
+      --pbkdf "$LUKS_EXPECTED_PBKDF" \
       --batch-mode \
       "$DATA_DEV" --key-file=- \
       || { rollback_format; fail "luksFormat failed on $DATA_DEV"; }

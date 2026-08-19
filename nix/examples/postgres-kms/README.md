@@ -56,7 +56,7 @@ This makes key provisioning two-phase, because pinning otherwise makes the depen
 
 | Step | Script | What it does |
 |---|---|---|
-| 1 | [`02a_create_kms_key.sh`](./scripts/steps/02a_create_kms_key.sh) | Creates the key under a bootstrap policy granting the provisioning principal `kms:PutKeyPolicy` + `kms:Encrypt` + `kms:ScheduleKeyDeletion` — no `Decrypt`, no attestation conditions — and writes the ARN to `kms-key-arn.txt`. |
+| 1 | [`02a_create_kms_key.sh`](./scripts/steps/02a_create_kms_key.sh) | Creates the key under a bootstrap policy granting the provisioning principal `kms:PutKeyPolicy` + `kms:Encrypt` + `kms:ScheduleKeyDeletion` — no `Decrypt`, no attestation conditions — and emits the ARN on stdout. `build.sh` (stage 3) writes and git-tracks the ARN pin. |
 | 2 | `00_create_ami.sh` | Builds and measures the image, with the ARN inside it. |
 | 3 | [`03_create_symmetric_key.sh`](./scripts/steps/03_create_symmetric_key.sh) | Wraps the symmetric key under the pinned key, using the bootstrap `kms:Encrypt` grant — **before** finalize revokes it. |
 | 4 | [`02b_finalize_kms_policy.sh`](./scripts/steps/02b_finalize_kms_policy.sh) | Installs the real PCR-gated policy and **drops `kms:PutKeyPolicy` and `kms:Encrypt` in the same call**, leaving the provisioning principal only `kms:ScheduleKeyDeletion` + `kms:ListGrants`/`kms:RevokeGrant` (for grant audit — see [Production Considerations](#production-considerations)). |
@@ -65,9 +65,9 @@ Step 4 is a one-way ratchet: by revoking `kms:Encrypt` and `kms:PutKeyPolicy` in
 
 Three consequences worth knowing before you build:
 
-- **`kms-key-arn.txt` must stay git-tracked.** When the flake ref resolves to `git+file://`, Nix only sees git-tracked paths, so an untracked file is invisible to the build. Edits to an already-tracked file *are* picked up from the dirty worktree, which is what makes the rewrite work. `02a` refuses to create a key if the file is untracked, so you find out before an orphan key exists.
+- **`kms-key-arn.txt` must stay git-tracked.** When the flake ref resolves to `git+file://`, Nix only sees git-tracked paths, so an untracked file is invisible to the build. Edits to an already-tracked file *are* picked up from the dirty worktree, which is what makes the rewrite work. `build.sh` (stage 3) refuses to proceed if the pinned ARN file is untracked, so you find out before an orphan key exists.
 - **An empty file means unpinned.** That keeps a fresh clone and CI buildable without AWS. The resulting image fails closed at boot rather than falling back to trusting user data. `clean.sh` truncates the file back to empty.
-- **The AMI is bound to one account, region and key.** A new key means a rebuild, a new PCR4 and a new policy, so `clean.sh` followed by `start.sh` can no longer reuse an image. That is inherent to pinning, not a limitation of this implementation — it turns the AMI from a reusable artifact into a per-deployment build.
+- **The AMI is bound to one account, region and key.** A new key means a rebuild, a new PCR4 and a new policy, so `clean.sh` followed by a full new ceremony can no longer reuse an image. That is inherent to pinning, not a limitation of this implementation — it turns the AMI from a reusable artifact into a per-deployment build.
 
 **Scope.** Pinning fixes *which key* is consulted, not *which ciphertext*. Because finalize revokes `kms:Encrypt`, no principal can wrap a fresh symmetric key under the pinned key after deployment, so the ciphertext-substitution vector is closed for the standing policy — the only wrap happens during provisioning (step 3), before the ratchet. The deployer necessarily sees that one plaintext DEK, since `05a_create_certificates.sh` needs it; trusting the deployer at provisioning time is inherent. Pinning a KMS *alias* ARN would sidestep the circularity but give up the property: `UpdateAlias` is mutable and would re-point the trust root without touching the image.
 
@@ -167,7 +167,6 @@ The following IAM permissions are required for the full end-to-end deployment fl
         "iam:ListRolePolicies",
         "iam:DetachRolePolicy",
         "iam:DeleteRolePolicy",
-        "iam:PutRolePolicy",
         "iam:AttachRolePolicy"
       ],
       "Resource": "*"
@@ -214,6 +213,36 @@ explicitly denies `kms:CreateGrant` to everyone. After installing the policy —
 which closes the window in which a grant could be planted — finalize verifies no
 grant exists and fails closed if one does, so the attestation condition remains
 the only path for decrypting the wrapped symmetric key.
+
+## Roles & Responsibilities
+
+The governing principle: **no single party may both control what code runs (the
+measurements) and hold the plaintext secrets.** A party holding both could sign a
+rogue image *and* gate the key to that image's PCRs, which makes the attestation
+guarantee worthless against an insider.
+
+| Role | Responsibility | Must not hold |
+|---|---|---|
+| **Deployer** | Build + sign the image, register the AMI, write the pinned `kms-key-arn.txt` | KMS policy control, `kms:Decrypt`, DEK, CA key |
+| **Key Custodian** | Create the KMS key, finalize the PCR-gated policy, audit grants, schedule deletion | `kms:Encrypt`, `kms:Decrypt`, signing key |
+| **Secrets / PKI Provisioner** | Mint + wrap the DEK, issue CA/server/client certs, upload bundles | `kms:PutKeyPolicy`, `kms:Decrypt`, signing key |
+| **Platform Operator** | IAM role/profile, EBS, launch, SG, SSM, teardown | `kms:Decrypt`, any bundle read, signing key |
+| **Application / Test Client** | Connect over mTLS as `postgres-client`, read the client bundle | KMS, server bundle, any provisioning write |
+| **Instance role** (machine) | Boot-time PCR-gated `kms:Decrypt` | everything else — it needs no identity policy at all |
+
+The JSON policy above is the **single-identity** policy: one principal running the
+whole flow. The per-role split is defined in
+[`scripts/lib/role-policies.sh`](scripts/lib/role-policies.sh), which is the source
+of truth, and provisioned by `scripts/steps/00_create_roles.sh --create-roles`.
+Supply no role ARNs and everything runs as the caller exactly as before.
+
+**What the automated test does and does not prove:** a single runner able to assume
+all five roles transitively holds all five, and on one host the workspace and
+`artifacts/` are a shared filesystem regardless of which credentials are active — the
+`AssumeRole` boundary is credential scope, not OS isolation. What it buys is
+*boundary-sufficiency validation*: each stage runs with only its role's permissions,
+so the run fails if a role lacks one it needs. True separation of duties needs
+distinct principals per role in a real pipeline.
 
 ## Getting Started
 
@@ -262,29 +291,55 @@ If you configured a specific profile, you can use it by setting the AWS_PROFILE 
 export AWS_PROFILE=myprofile
 ```
 
-The `start.sh` script will automatically detect credentials from either environment variables or your AWS configuration.
+Each stage script automatically detects credentials from either environment variables or your AWS configuration.
 
-### 2. Create Test Setup
+### 2. Run the Deployment Ceremony
 
-Run the following script to build the Attestable image and set up the necessary AWS resources:
+The deployment splits across six role-scoped stages. Pass the value each stage emits
+directly to the next stage.
+
+**Automated (single runner, CI-friendly):**
 
 ```sh
-./scripts/start.sh
+./scripts/e2e-test.sh --create-roles --authorize-my-ip
 ```
 
-This script performs the following actions:
+This drives all six stages under assumed roles, validates mTLS connectivity, and
+confirms data persistence across instance termination. See
+[End-to-End Testing](#end-to-end-testing) for the full flag reference.
 
-* Creates the KMS key first, under a bootstrap policy, and pins its ARN into `kms-key-arn.txt` so the build measures it (see [KMS key pinning](#kms-key-pinning))
-* Builds an image with NixOS containing:
-    * [KMS decrypt application](https://github.com/aws/NitroTPM-Tools/blob/main/nitro-tpm-attest/examples/kms_decrypt.rs) for fetching attestation documents and decrypting ciphertexts
-    * [Systemd service](./kms-init.nix) to decrypt and store the symmetric key on system boot
-    * [LUKS unlock service](./luks-init.nix) to format (first boot) or unlock (subsequent boots) the encrypted EBS volume
-    * [Certificate init service](./cert-init.nix) to decrypt the server TLS certificate bundle at boot
-    * PostgreSQL service configured with SSL and mTLS (`clientcert=verify-full`) on the encrypted volume
-* Creates an AMI from the image using EBS direct API
-* Sets up AWS resources including an instance role, the finalized PCR-gated KMS key policy, an encrypted symmetric key, and a blank EBS volume
-* Generates a CA and TLS certificates, encrypts the server bundle into user data, and stores the client bundle in AWS Secrets Manager
-* Launches an EC2 instance using the new AMI with the EBS volume attached as `/dev/xvdf`. The instance's user data includes the ciphertext of the symmetric key, the KMS key ARN, and the encrypted server certificate bundle.
+**Manual (six stages, one role each):**
+
+```sh
+# Stage 1 — Operator: create the instance role and profile
+./scripts/prepare-role.sh
+# → emits INSTANCE_ROLE_ARN and INSTANCE_PROFILE_NAME
+
+# Stage 2 — Key Custodian: create the KMS key under a bootstrap policy
+./scripts/create-key.sh
+# → copy the KMS key ARN from the 'KMS key created with ARN:' line
+
+# Stage 3 — Deployer: pin the ARN into the image, build, sign, register the AMI
+./scripts/build.sh --key-id <KMS_KEY_ARN>
+# → emits AMI_ID and PCR_DIR; the Deployer holds no kms:PutKeyPolicy so it stops here
+
+# Stage 4 — Provisioner: wrap the DEK and issue mTLS certificates
+./scripts/provision-secrets.sh --key-id <KMS_KEY_ARN>
+
+# Stage 5 — Key Custodian: install the PCR-gated policy, revoke Encrypt, audit grants
+./scripts/finalize-key.sh --key-id <KMS_KEY_ARN> \
+  --instance-role-arn <INSTANCE_ROLE_ARN> --pcr-dir <PCR_DIR>
+
+# Stage 6 — Operator: create the data volume and launch the instance
+./scripts/deploy.sh --ami-id <AMI_ID> --instance-profile <INSTANCE_PROFILE_NAME>
+```
+
+Each stage resolves AWS credentials from the environment or `~/.aws/config`, and all
+resource IDs are accumulated in `artifacts/resources.json`. Omit the optional
+`*-role-arn` flags and every stage runs under the ambient credentials — the same
+single-identity behaviour as before. See
+[Roles & Responsibilities](#roles--responsibilities) for a summary of what each
+role may and may not do.
 
 **User-data format.** The artifacts are passed to the instance as a single JSON object on EC2 user data (read at boot via IMDSv2). All binary values are single-line base64:
 
@@ -302,7 +357,7 @@ This script performs the following actions:
 
 The **client** certs (`ca.crt`, `client.crt`, `client.key`) are not in user data — they are stored separately in AWS Secrets Manager (base64 fields in a JSON secret) and used by the connecting client.
 
-Optional flags:
+Optional flags for `build.sh`:
 - `--secure-boot` — sign the UKI for secure boot as a post-build step (ephemeral local keys; PCR7 changes each run)
 - `--secure-boot --secrets-manager [ARN]` — persist/reuse a secure boot golden identity in AWS Secrets Manager for reproducible PCR7 (keeps `db.key` off disk)
 - `--debug` — build with debug console access and SSM (Systems Manager) remote shell enabled
@@ -311,13 +366,13 @@ Optional flags:
 
 ### 3. Test PostgreSQL
 
-The instance is launched with a **public IP** and PostgreSQL is accessible over mTLS on port 5432 at that address. The security group only allows the VPC CIDR by default, so `start.sh` prints an **ACTION REQUIRED** notice at the end with the security group ID and your detected public IP. Authorize your host before connecting:
+The instance is launched with a **public IP** and PostgreSQL is accessible over mTLS on port 5432 at that address. The security group only allows the VPC CIDR by default, so `deploy.sh` prints an **ACTION REQUIRED** notice at the end with the security group ID and your detected public IP. Authorize your host before connecting:
 
 ```sh
 # Find your public IP:
 curl -s https://checkip.amazonaws.com
 
-# Authorize it on the security group start.sh printed (also in artifacts/resources.json):
+# Authorize it on the security group deploy.sh printed (also in artifacts/resources.json):
 aws ec2 authorize-security-group-ingress \
   --group-id <SG_ID_FROM_OUTPUT> --protocol tcp --port 5432 \
   --cidr <YOUR_PUBLIC_IP>/32
@@ -334,7 +389,7 @@ echo "$SECRET_JSON" | jq -r '.client_cert' | base64 -d > /tmp/client.crt
 echo "$SECRET_JSON" | jq -r '.client_key' | base64 -d > /tmp/client.key
 chmod 600 /tmp/client.key
 
-# Connect via mTLS (use the EC2 Public IP from the start.sh summary)
+# Connect via mTLS (use the EC2 Public IP from the deploy.sh summary)
 psql "sslmode=verify-ca sslcert=/tmp/client.crt sslkey=/tmp/client.key sslrootcert=/tmp/ca.crt host=<INSTANCE_PUBLIC_IP> port=5432 dbname=postgres user=postgres-client"
 ```
 
@@ -374,7 +429,7 @@ post-build step, not as a distinct image package:
 - Without secure boot, the TPM measures the Unified Kernel Image (UKI) into PCR4. Builds are fully reproducible — same source produces identical images with identical PCR4 values.
 - With secure boot, the unsigned UKI is signed with the `db` key by the `sign-efi-image` app (run outside the nix derivation, so `db.key` never enters the nix store); the signed UKI is patched into the ESP, the UEFI variable store is built from the PK/KEK/db ESLs, and PCR4 + PCR7 are computed against the signed image. This prevents unauthorized bootloaders from running.
 
-`start.sh --secure-boot` generates an **ephemeral** local key hierarchy for a
+`build.sh --secure-boot` generates an **ephemeral** local key hierarchy for a
 one-off signed build; PCR7 changes on every run because the keys (and their
 GUID) are freshly generated. For **reproducible** PCR7, add `--secrets-manager`:
 the whole secure boot golden identity (fixed GUID + PK/KEK/db certs, plus the
@@ -436,30 +491,38 @@ psql "sslmode=verify-full sslcert=/tmp/client.crt sslkey=/tmp/client.key sslroot
 
 This example is a demonstrator. A production deployment additionally requires:
 
-- **Split the deployment role from the operator role.** The principal that provisions the key sees the plaintext DEK at wrap time (step 3) and holds `kms:ScheduleKeyDeletion` afterward. Day-to-day operators who launch, reattach, or terminate instances must not inherit those rights — give them a separate role scoped to EC2/EBS so no standing identity can both mint ciphertext and destroy the key.
-- **The KMS key ARN is baked into the AMI, not taken from user data.** User data is not measured into any PCR, so a `key_id` supplied there cannot be trusted; pinning the ARN into the measured image (`kms-key-arn.txt` → PCR4) is what binds the attestation to *which* key is consulted (see [KMS key pinning](#kms-key-pinning)).
-- **KMS grants are checked and kept revocable, because the policy swap doesn't cover them.** Grants are a separate authorization instrument — exempt from the policy's PCR conditions and untouched by `put-key-policy`. In the bootstrap window (step 1) the provisioning principal holds `kms:PutKeyPolicy`, which transitively allows planting a `kms:CreateGrant`; such a grant would give its grantee attestation-free `Decrypt` that survives finalize. Finalize (`02b`) closes this: it installs the final policy first — which denies `kms:CreateGrant` to everyone and drops `kms:PutKeyPolicy`, so no *new* grant can appear — then verifies none was planted during the window and **fails closed** if one exists, keeping `kms:ListGrants`/`kms:RevokeGrant` on the admin so grants stay detectable and revocable. (The check runs *after* the swap on purpose: a pre-swap check races the plant, whereas by the time the window is closed any grant present was necessarily planted earlier.) The window itself is unavoidable — PCR4 measures the pinned key ARN, so the key must exist before the image, ruling out single-shot creation with the final policy.
-
-  This defends against accidental grants, a third-party principal, and compromised tooling under an honest operator. It does **not** stop a *malicious* operator: while they hold `kms:PutKeyPolicy` they can edit or single-step `02b` to drop a grant and never run the check — no in-script check can bind a principal who controls execution. The real defense is **separation of duties**: give the operator only `kms:Encrypt` in the bootstrap policy (enough to wrap the DEK), and have a separate finalizer principal (CI role or break-glass identity, out-of-band credentials) hold `kms:PutKeyPolicy` and run `02b`, receiving `kms:ListGrants`/`kms:RevokeGrant` in the final policy. Absent that split, treat a non-empty `aws kms list-grants` at any time as an incident.
+- **Distinct principals per role, and a Custodian trusted for the bootstrap window.**
+  The five-role split ([Roles & Responsibilities](#roles--responsibilities)) is
+  implemented, but omitting the `*-role-arn` flags collapses every stage onto the
+  caller — which then holds `kms:PutKeyPolicy` and `kms:Encrypt` together, the exact
+  pair the split exists to break (`create-key.sh` warns when it does). Even with
+  separate ARNs the Custodian holds `kms:PutKeyPolicy` for the whole bootstrap
+  window, so it can self-escalate to `kms:CreateGrant` and plant a grant that is
+  exempt from the PCR conditions and survives finalize. `02b`'s post-swap grant audit
+  (see [Minimal IAM Privileges](#minimal-iam-privileges)) catches accidental grants,
+  third-party principals and compromised tooling under an *honest* Custodian; no
+  in-script check binds a principal who can edit or single-step the script. The
+  window itself is unavoidable — PCR4 measures the pinned key ARN, so the key must
+  exist before the image.
 - **The symmetric key is generated in the provisioning pipeline, not inside the TEE.** This is a deliberate recoverability-vs-custody tradeoff — see [DEK custody: pipeline vs. TEE generation](#dek-custody-pipeline-vs-tee-generation) below.
 - **Private (no public IP) deployment needs a KMS interface VPC endpoint.** This example launches with a public IP so mTLS is reachable and `kms-init` can reach the public KMS endpoint. A production instance in a private subnet has no route to public KMS (the default VPC has an Internet Gateway but no NAT), so `kms-init` fails at boot unless the subnet has a KMS interface VPC endpoint (PrivateLink) — or a NAT gateway — reachable from the instance.
-- **Move CA issuance off the operator's machine.** mTLS auth is scoped so only a `CN=postgres-client` cert maps to the `postgres-client` role and the `postgres` superuser is rejected over TCP (`ALTER ROLE postgres NOLOGIN` makes that permanent) — this closes the network-superuser/shell path. But the deploying operator still generates the CA key locally (`05a_create_certificates.sh`), so they can mint a valid `postgres-client` cert and reach the data. mTLS here protects against superuser escalation, not against the deployer reading data. Longer term, move CA issuance off the operator's machine (e.g. AWS Private CA with an enforced subject-name policy) so CA custody is not the operator's by construction.
+- **Move CA issuance off the Provisioner's host.** mTLS auth is scoped so only a `CN=postgres-client` cert maps to the `postgres-client` role and the `postgres` superuser is rejected over TCP (`ALTER ROLE postgres NOLOGIN` makes that permanent) — this closes the network-superuser/shell path. But the **Provisioner** still generates the CA key locally (`05a_create_certificates.sh`), so it can mint a valid `postgres-client` cert and reach the data. mTLS here protects against superuser escalation, not against the Provisioner reading data — and the role split cannot fix it, because the CA key and the DEK are deliberately co-located in one stage. Longer term, move CA issuance off the provisioning host entirely (e.g. AWS Private CA with an enforced subject-name policy) so CA custody belongs to no provisioning role by construction.
 - **Snapshot rollback is not prevented — dm-integrity authenticates each sector, not the volume's freshness.** The data volume is LUKS2 with `--integrity hmac-sha256`, authenticating each sector as `HMAC(key, data‖sector)` with no counter or hash tree, so any `(ciphertext, tag)` pair ever valid for a sector verifies forever. An operator with EBS snapshot access can snapshot the volume at two times, splice authentic old sectors (with their tags) into the newer image, and reboot: attestation, KMS release, LUKS unlock, and the per-page checksums all pass, and PostgreSQL serves a mixed-epoch state — e.g. a revoked credential restored to its former value. This is replay of *authentic* data, not chosen-plaintext forgery; confidentiality is unaffected and authenticated encryption alone cannot stop it. Closing it needs freshness the operator cannot snapshot-and-splice: archive WAL to an external TEE-authenticated sink and check LSN/timeline monotonicity at startup, or — coarser — seal a high-water-mark checkpoint LSN under the KMS/NitroTPM key and refuse to start if the on-disk volume is older.
 
 ### DEK custody: pipeline vs. TEE generation
 
-The LUKS DEK (and the mTLS bundle password, the same key) is minted **in the pipeline**: the deployer generates the plaintext, wraps it with `kms:Encrypt`, and ships the ciphertext in user data. The alternative is minting it **inside the TEE** on first boot — `luks-init` generates the key in tmpfs, `luksFormat`s, wraps it over the attested path, and stores the ciphertext as a LUKS2 token in the volume header.
+The LUKS DEK (and the mTLS bundle password, the same key) is minted **in the pipeline**: the Provisioner generates the plaintext, wraps it with `kms:Encrypt`, and ships the ciphertext in user data. The alternative is minting it **inside the TEE** on first boot — `luks-init` generates the key in tmpfs, `luksFormat`s, wraps it over the attested path, and stores the ciphertext as a LUKS2 token in the volume header.
 
 | | Pipeline (current) | TEE first-boot |
 |---|---|---|
-| **Custody** | Deployer sees the plaintext; can `luksOpen` on any machine | Plaintext never leaves the enclave; every unlock goes through attestation |
+| **Custody** | Provisioner sees the plaintext; can `luksOpen` on any machine | Plaintext never leaves the enclave; every unlock goes through attestation |
 | **Recovery** | Out-of-band with the held plaintext | Relaunch the *same measured AMI* (PCR4/PCR7 must match) + attach the volume |
 | **Durability** | Ciphertext lives in the launch template | Only copy is the volume header → needs an off-volume `luksHeaderBackup` |
 | **Boot logic** | `kms-init` decrypts a user-data blob | Extra first-boot generate/format/wrap (idempotent via the header check) |
 
 The TEE model shifts the discipline from "guard the plaintext key file" to "guard the KMS key and the AMI": never `ScheduleKeyDeletion` while data is needed, retain the exact AMI + secure-boot identity, keep a `luksHeaderBackup` (it is ciphertext — useless without KMS and a matching-PCR attestation).
 
-Adopting it touches four places: `luks-init.nix` gains first-boot keygen/wrap and later-boot unwrap; `03_create_symmetric_key.sh` drops keygen; the KMS policy grants PCR-gated `kms:Encrypt` to the **instance role** rather than the deployer (so Encrypt can only be pinned to the attested role, not revoked outright); `05a_create_certificates.sh` wraps the server bundle the same way. A lighter interim step — a mandatory first-boot re-key (`luksAddKey` a TEE key, `luksKillSlot` the operator slot) — shrinks but does not remove custody, since the plaintext still existed on the operator's machine at provisioning.
+Adopting it touches four places: `luks-init.nix` gains first-boot keygen/wrap and later-boot unwrap; `03_create_symmetric_key.sh` drops keygen; the KMS policy grants PCR-gated `kms:Encrypt` to the **instance role** rather than the Provisioner (so Encrypt can only be pinned to the attested role, not revoked outright); `05a_create_certificates.sh` wraps the server bundle the same way. A lighter interim step — a mandatory first-boot re-key (`luksAddKey` a TEE key, `luksKillSlot` the provisioned slot) — shrinks but does not remove custody, since the plaintext still existed on the Provisioner's host at provisioning. Adopting the TEE model would also delete the Provisioner's DEK duty outright, shrinking the five-role split by one custody point.
 
 ## Cleanup
 
@@ -481,7 +544,7 @@ For full lifecycle validation — including mTLS connectivity and data persisten
 
 This script provisions all resources (including certificate generation and Secrets Manager storage), validates PostgreSQL connectivity over mTLS on first boot, writes test data, terminates the instance, launches a new instance with the same EBS volume, verifies the data persists over mTLS, and then cleans up all resources including the Secrets Manager secret and IAM inline policies.
 
-Like `start.sh`, the E2E test launches the instance with a **public IP** so it can validate mTLS from a host outside the VPC — e.g. a laptop or a remote dev box.
+Like the full ceremony, the E2E test launches the instance with a **public IP** so it can validate mTLS from a host outside the VPC — e.g. a laptop or a remote dev box.
 
 > **Prerequisite — allowlist your host on the security group.** The instance's security group only permits inbound 5432 from the VPC CIDR, so your host's public IP must be added before the mTLS checks can connect. The script prints an **ACTION REQUIRED** notice with the security group ID and your detected public IP, then (when run interactively) pauses so you can add the rule:
 >
@@ -511,7 +574,7 @@ Flags:
 - `--debug` — adds SSM-based checks alongside mTLS
 - `--timeout` — validation timeout in seconds (default: 600)
 - `--no-cleanup` — skip resource teardown on failure for debugging
-- `--admin-role-arn <ARN>` — override the KMS key admin principal
+- `--admin-role-arn <ARN>` — *(deprecated; use `--custodian-role-arn`)* aliases to the Custodian role: the principal that creates the key, installs the final policy, and audits grants
 - `--vpc-id <ID>` — launch into a specific VPC (default VPC otherwise)
 - `--start-phase <1|2|3>` — resume a prior `--no-cleanup` run at a later phase (2 = first-boot validation, 3 = persistence). Provisioning is skipped and resource IDs are read from `artifacts/resources.json` (the instance's public IP is re-derived from the recorded `INSTANCE_ID`, and the SG-authorization notice is re-printed). Requires that a previous run left `resources.json` in place. Pair with `--no-cleanup` to keep iterating.
 

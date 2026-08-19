@@ -136,7 +136,6 @@
                 Type = "oneshot";
                 ExecStart = luksInitScript;
                 RemainAfterExit = true;
-                # First-boot --integrity wipe is a full-device write; 1800s covers large volumes.
                 TimeoutStartSec = "1800s";
                 ProtectKernelTunables = true;
                 ProtectControlGroups = true;
@@ -366,7 +365,25 @@
                 ReadOnlyPaths = [ "/run/postgresql-certs" ];
                 # noexec: certs are read only as TLS data, so block dlopen of a
                 # polyglot ca.crt planted via session_preload_libraries (outranks -c pins).
-                NoExecPaths = [ "/run/postgresql-certs" ];
+                # /run/postgresql is postgres-writable, so it needs the same treatment.
+                NoExecPaths = [ "/run/postgresql-certs" "/run/postgresql" ];
+
+                # Contains a backend compromised via the forged /data catalog. Fork/exec
+                # cannot be filtered (fork-per-connection), so deny everything else and
+                # rely on /data + /run noexec to leave no write+execute path.
+                CapabilityBoundingSet = "";
+                NoNewPrivileges = true;
+                LockPersonality = true;
+                RestrictNamespaces = true;
+                RestrictRealtime = true;
+                RestrictSUIDSGID = true;
+                ProtectClock = true;
+                ProtectControlGroups = true;
+                ProtectHostname = true;
+                ProtectKernelLogs = true;
+                ProtectKernelModules = true;
+                ProtectKernelTunables = true;
+                ProtectProc = "invisible";
               };
             };
 

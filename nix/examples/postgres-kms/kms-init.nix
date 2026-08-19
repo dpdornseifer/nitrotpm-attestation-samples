@@ -9,7 +9,6 @@ pkgs.writeScript "kms-init.sh" ''
   #!${pkgs.bash}/bin/bash
   set -euo pipefail
 
-  # Sourced from the store, covered by dm-verity and measured into PCR4.
   . ${./kms-verify.sh}
 
   # KMS key fixed at build time; empty = buildable but unbootable (see kms-verify.sh).
@@ -24,11 +23,26 @@ pkgs.writeScript "kms-init.sh" ''
   KEY_ID=$(echo "$USER_DATA" | ${pkgs.jq}/bin/jq -r '.key_id // ""')
   CIPHERTEXT=$(echo "$USER_DATA" | ${pkgs.jq}/bin/jq -re .ciphertext)
 
-  # user-data is unmeasured; enforce the pinned ARN to prevent key substitution.
   kms_verify_pinned_key_id "$PINNED_KMS_KEY_ARN" "$KEY_ID" \
     || { echo "FATAL: refusing to decrypt against an unpinned or substituted KMS key" >&2; exit 1; }
 
+  # '-' is not in the base64 alphabet, so this is what stops unmeasured user-data from
+  # reaching the decrypt helper as a flag.
+  case "$CIPHERTEXT" in
+    "" | *[^A-Za-z0-9+/=]* )
+      echo "FATAL: ciphertext is not base64; refusing to pass it to the decrypt helper" >&2
+      exit 1 ;;
+  esac
+
   # Decrypt against PINNED_KMS_KEY_ARN, not $KEY_ID: the guarantee comes from the measurement.
   SYMMETRIC_KEY=$(${nitro-tee.packages.${system}.kms-decrypt-app}/bin/nitro-tpm-kms-decrypt --key-id "$PINNED_KMS_KEY_ARN" "$CIPHERTEXT")
+
+  # A failed decrypt must not become the LUKS passphrase.
+  case "$SYMMETRIC_KEY" in
+    "" | *[^A-Za-z0-9+/=]* )
+      echo "FATAL: decrypt helper returned no usable key material" >&2
+      exit 1 ;;
+  esac
+
   echo "$SYMMETRIC_KEY" > /run/kms-init/symmetric_key
 ''

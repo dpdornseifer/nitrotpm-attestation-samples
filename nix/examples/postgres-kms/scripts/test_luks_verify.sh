@@ -65,13 +65,17 @@ header_json() {
   local base
   # shellcheck disable=SC2016  # $enc is a jq --arg binding, not a shell variable
   base='{
-    keyslots: {"0": {type: "luks2", key_size: 96}},
+    keyslots: {"0": {
+      type: "luks2", key_size: 96,
+      kdf: {type: "argon2id", time: 4, memory: 1048576, cpus: 4},
+      af: {type: "luks1", stripes: 4000, hash: "sha256"}
+    }},
     tokens: {},
     segments: {"0": {
       type: "crypt", offset: "16777216", size: "dynamic", iv_tweak: "0",
       encryption: $enc, sector_size: '"$ss"'
     }},
-    digests: {"0": {type: "pbkdf2"}},
+    digests: {"0": {type: "pbkdf2", keyslots: ["0"], segments: ["0"]}},
     config: {json_size: "12288", keyslots_size: "16744448"}
   }'
   if [ -n "$integ" ]; then
@@ -98,7 +102,7 @@ status_text() {
     printf '  integrity tag size: 32 [bytes] \n'
   fi
   printf '  device:  /dev/nvme1n1\n'
-  printf '  sector size:  4096 [bytes]\n'
+  printf '  sector size:  %s\n' "${4:-4096 [bytes]}"
   printf '  offset:  0 [512-byte units] (0 [bytes])\n'
   printf '  mode:    read/write\n'
 }
@@ -128,6 +132,39 @@ assert_rejects "header: rejects more than one segment" \
 
 assert_rejects "header: rejects a segment that is not type crypt" \
   luks_verify_header_json "$(jq -c '.segments["0"].type = "linear"' <<<"$GOOD_HEADER")"
+
+assert_rejects "header: rejects a second keyslot (attacker-added unlock path)" \
+  luks_verify_header_json "$(jq -c '.keyslots["1"] = .keyslots["0"]' <<<"$GOOD_HEADER")"
+
+assert_rejects "header: rejects zero keyslots" \
+  luks_verify_header_json "$(jq -c '.keyslots = {}' <<<"$GOOD_HEADER")"
+
+assert_rejects "header: rejects a short keyslot key (integrity key dropped)" \
+  luks_verify_header_json "$(jq -c '.keyslots["0"].key_size = 64' <<<"$GOOD_HEADER")"
+
+assert_rejects "header: rejects a one-byte keyslot key" \
+  luks_verify_header_json "$(jq -c '.keyslots["0"].key_size = 1' <<<"$GOOD_HEADER")"
+
+assert_rejects "header: rejects a keyslot that is not type luks2" \
+  luks_verify_header_json "$(jq -c '.keyslots["0"].type = "reencrypt"' <<<"$GOOD_HEADER")"
+
+assert_rejects "header: rejects a downgraded keyslot KDF" \
+  luks_verify_header_json "$(jq -c '.keyslots["0"].kdf.type = "pbkdf2"' <<<"$GOOD_HEADER")"
+
+assert_rejects "header: rejects a missing keyslot KDF" \
+  luks_verify_header_json "$(jq -c 'del(.keyslots["0"].kdf)' <<<"$GOOD_HEADER")"
+
+assert_rejects "header: rejects a digest bound to a different keyslot" \
+  luks_verify_header_json "$(jq -c '.digests["0"].keyslots = ["1"]' <<<"$GOOD_HEADER")"
+
+assert_rejects "header: rejects a digest bound to a different segment" \
+  luks_verify_header_json "$(jq -c '.digests["0"].segments = ["1"]' <<<"$GOOD_HEADER")"
+
+assert_rejects "header: rejects a second digest" \
+  luks_verify_header_json "$(jq -c '.digests["1"] = .digests["0"]' <<<"$GOOD_HEADER")"
+
+assert_rejects "header: rejects any token (alternative unlock path)" \
+  luks_verify_header_json "$(jq -c '.tokens["0"] = {type: "systemd-tpm2"}' <<<"$GOOD_HEADER")"
 
 assert_rejects "header: rejects malformed JSON" \
   luks_verify_header_json "not json at all"
@@ -166,6 +203,14 @@ assert_rejects_because "status: rejects wrong keysize in the older 'bits' format
 assert_rejects_because "status: does not confuse 'integrity keysize:' with 'keysize:'" \
   luks_verify_status "$(printf '  cipher:  aes-xts-plain64\n  integrity keysize: 768 [bits]\n  keysize: 256 [bits]\n  integrity: hmac(sha256)\n')" \
   "active keysize"
+
+assert_rejects_because "status: rejects wrong sector size on the active mapping" \
+  luks_verify_status "$(status_text aes-xts-plain64 '768 [bits]' 'hmac(sha256)' '512 [bytes]')" \
+  "active sector size"
+
+assert_rejects_because "status: rejects a mapping with no sector size reported" \
+  luks_verify_status "$(printf '  cipher:  aes-xts-plain64\n  integrity: hmac(sha256)\n  keysize: 768 [bits]\n')" \
+  "no sector size"
 
 assert_rejects "status: rejects empty input" \
   luks_verify_status ""

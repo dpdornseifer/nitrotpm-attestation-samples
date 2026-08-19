@@ -63,6 +63,7 @@ LOOP_A=$LOOP_DEV
   --key-size "$LUKS_EXPECTED_KEYSIZE" \
   --integrity "$LUKS_EXPECTED_INTEGRITY_ARG" \
   --sector-size "$LUKS_EXPECTED_SECTOR_SIZE" \
+  --pbkdf "$LUKS_EXPECTED_PBKDF" \
   --batch-mode "$LOOP_A" --key-file="$KEYFILE" \
   || { echo "luksFormat with the pinned parameters FAILED -- the format itself is wrong"; exit 1; }
 
@@ -148,6 +149,7 @@ DUMPE2FS=$(command -v dumpe2fs || echo /sbin/dumpe2fs)
   --key-size "$LUKS_EXPECTED_KEYSIZE" \
   --integrity "$LUKS_EXPECTED_INTEGRITY_ARG" \
   --sector-size "$LUKS_EXPECTED_SECTOR_SIZE" \
+  --pbkdf "$LUKS_EXPECTED_PBKDF" \
   --batch-mode "$LOOP_D" --key-file="$KEYFILE" || exit 1
 "$CRYPTSETUP" open --type luks2 "$LOOP_D" tamper_test_d --key-file="$KEYFILE" || exit 1
 MAP=tamper_test_d

@@ -4,6 +4,21 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 ARTIFACTS_DIR="$SCRIPT_DIR/../artifacts"
 RESOURCES_FILE="$ARTIFACTS_DIR/resources.json"
 
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib/roles.sh
+. "$SCRIPT_DIR/lib/roles.sh"
+
+CUSTODIAN_ROLE_ARN=""
+DELETE_PROVISIONING_ROLES=false
+while [[ "$#" -gt 0 ]]; do
+  case $1 in
+    --custodian-role-arn) CUSTODIAN_ROLE_ARN="$2"; shift ;;
+    --delete-provisioning-roles) DELETE_PROVISIONING_ROLES=true ;;
+    *) echo "Unknown option $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
 if [ ! -f "$RESOURCES_FILE" ]; then
   echo "Resources file not found: $RESOURCES_FILE"
   exit 1
@@ -31,11 +46,16 @@ VOLUME_ID=$(jq -r '.VOLUME_ID // empty' "$RESOURCES_FILE")
 SECRET_ARN=$(jq -r '.SECRET_ARN // empty' "$RESOURCES_FILE")
 IDENTITY_ARN=$(jq -r '.IDENTITY_ARN // empty' "$RESOURCES_FILE")
 
+# Prefer an explicit flag; fall back to what the run recorded.
+if [ -z "$CUSTODIAN_ROLE_ARN" ]; then
+  CUSTODIAN_ROLE_ARN=$(jq -r '.CUSTODIAN_ROLE_ARN // empty' "$RESOURCES_FILE")
+fi
+
 CLEANUP_SUCCESS=true
 
 run_aws_command() {
-  if ! output=$(aws $@ 2>&1); then
-    echo "Error executing: aws $@"
+  if ! output=$(aws "$@" 2>&1); then
+    echo "Error executing: aws $*"
     echo "Output: $output"
     CLEANUP_SUCCESS=false
     return 1
@@ -43,8 +63,8 @@ run_aws_command() {
 }
 
 run_aws_command_optional() {
-  if ! output=$(aws $@ 2>&1); then
-    echo "Warning: aws $@"
+  if ! output=$(aws "$@" 2>&1); then
+    echo "Warning: aws $*"
     echo "Output: $output"
     return 1
   fi
@@ -129,8 +149,33 @@ if [ -n "$INSTANCE_PROFILE_NAME" ] && [ -n "$ROLE_NAME" ]; then
 fi
 
 if [ -n "$KMS_KEY_ARN" ]; then
+  # Key deletion is the Custodian's, not the Operator's: the final policy grants
+  # ScheduleKeyDeletion to the Custodian alone. Passthrough when no ARN is given.
   echo "Scheduling KMS key for deletion: $KMS_KEY_ARN"
-  run_aws_command kms schedule-key-deletion --key-id "$KMS_KEY_ARN" --pending-window-in-days 7
+  kms_err=""
+  # shellcheck disable=SC2069  # 2>&1 >/dev/null is intentional: capture stderr, discard stdout
+  if ! kms_err=$(assume_role_exec "$CUSTODIAN_ROLE_ARN" -- aws kms schedule-key-deletion --key-id "$KMS_KEY_ARN" --pending-window-in-days 7 2>&1 >/dev/null); then
+    echo "Error executing: kms schedule-key-deletion --key-id $KMS_KEY_ARN"
+    echo "Output: $kms_err"
+    CLEANUP_SUCCESS=false
+  fi
+fi
+
+if [ "$DELETE_PROVISIONING_ROLES" = true ]; then
+  # NOTE: deleting provisioning roles requires elevated IAM permissions (iam:GetRole,
+  # iam:DeleteRolePolicy, iam:DeleteRole on the NitroTpm* roles) that are NOT included
+  # in the Operator role policy. Failures here mean the provisioning roles remain and
+  # must be removed manually or with an appropriately privileged principal.
+  for PROV_ROLE in NitroTpmCustodianRole NitroTpmProvisionerRole NitroTpmDeployerRole \
+                   NitroTpmOperatorRole NitroTpmTestClientRole; do
+    if aws iam get-role --role-name "$PROV_ROLE" >/dev/null 2>&1; then
+      for POLICY_NAME in $(aws iam list-role-policies --role-name "$PROV_ROLE" --query 'PolicyNames[]' --output text 2>/dev/null); do
+        run_aws_command_optional iam delete-role-policy --role-name "$PROV_ROLE" --policy-name "$POLICY_NAME"
+      done
+      echo "Deleting provisioning role: $PROV_ROLE"
+      run_aws_command_optional iam delete-role --role-name "$PROV_ROLE"
+    fi
+  done
 fi
 
 rm -rf "$SCRIPT_DIR/../sb-keys" "$SCRIPT_DIR/../signed-image"
