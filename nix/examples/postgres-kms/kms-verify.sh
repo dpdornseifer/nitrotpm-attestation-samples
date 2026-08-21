@@ -1,5 +1,4 @@
 # shellcheck shell=bash
-#
 # Binds this image to one KMS key ARN. User-data isn't measured, so pinning the ARN into the
 # measured store (PCR4) stops an operator launching the genuine AMI against a key they control.
 # Fixes *which* key, not *which* ciphertext. Sourced by kms-init.nix + scripts/test_kms_verify.sh.

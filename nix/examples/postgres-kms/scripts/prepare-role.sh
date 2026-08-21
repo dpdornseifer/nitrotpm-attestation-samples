@@ -1,14 +1,10 @@
 #!/bin/bash
 # Stage 1 of 6 — PLATFORM OPERATOR.
-#
-# Creates the workload instance role and profile. This is its own stage because KMS
-# validates key-policy principals (lib/kms.sh retries on "invalid principals"), so
-# the role must exist before stage 5 finalizes the policy. It cannot live in
-# create-key.sh — a Custodian that also creates the instance role could gate the key
-# to a role it controls — nor in build.sh, which would give the Deployer control of
-# both the code and the principal the key trusts.
-#
-# Diagnostics go to stderr; stdout carries only NAME: VALUE handoff lines.
+# Creates the workload instance role and profile. Must run before stage 5: KMS
+# validates key-policy principals at put-key-policy time. Cannot live in
+# create-key.sh (Custodian would control the principal) or build.sh (Deployer
+# would control both the code and the trusted principal).
+# Diagnostics → stderr; stdout carries only NAME: VALUE handoff lines.
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"

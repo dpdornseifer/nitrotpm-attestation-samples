@@ -1,14 +1,9 @@
 #!/bin/bash
 # Stage 5 of 6 — KEY CUSTODIAN.
-#
-# Installs the final key policy: Decrypt gated on the instance role AND the PCR
-# values, kms:Encrypt and kms:PutKeyPolicy revoked, kms:CreateGrant denied to
-# everyone, then audits for a grant planted during the bootstrap window.
-#
-# This is the cross-role gate. The PCRs come from the Deployer (stage 3) and the
-# instance role from the Operator (stage 1), and only the Custodian can install the
-# policy — so no single party both decides what code runs and decides which
-# measurements release the key.
+# Installs the final PCR-gated key policy, revokes Encrypt and PutKeyPolicy,
+# then audits for grants planted during the bootstrap window.
+# Cross-role gate: PCRs from the Deployer + instance role from the Operator,
+# policy installed by the Custodian — no single party controls both.
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -50,9 +45,7 @@ while [[ "$#" -gt 0 ]]; do
   shift
 done
 
-# Fail closed on every missing input. A finalize that proceeds without PCRs would
-# install a policy gated on nothing — weaker than not finalizing, and it would look
-# like success.
+# Fail closed: a PCR-less policy looks like success while gating on nothing.
 for REQUIRED in KEY_ID INSTANCE_ROLE_ARN PCR_DIR; do
   if [ -z "${!REQUIRED}" ]; then
     echo "Error: --${REQUIRED//_/-} is required." >&2
@@ -65,9 +58,8 @@ if [ ! -f "$PCR_DIR/tpm_pcr.json" ]; then
   exit 1
 fi
 
-# A PCR4-only gate must be a choice, not a side effect of which directory was passed:
-# result/ carries PCR4 alone (lib.nix strips PCR7, since signing happens after the build)
-# while signed-image/ carries both, and either one used to report success.
+# PCR4-only must be explicit: result/ has PCR4 only (PCR7 added by sign step); signed-image/
+# has both.
 if jq -e '.Measurements.PCR7 | type == "string"' "$PCR_DIR/tpm_pcr.json" >/dev/null 2>&1; then
   REQUIRE_PCRS="PCR4 PCR7"
 elif [ "$ALLOW_PCR4_ONLY" = true ]; then
@@ -90,8 +82,7 @@ CUSTODIAN_PRINCIPAL=$(resolve_policy_principal "$CUSTODIAN_ROLE_ARN")
 
 echo "Stage 5/6 (Custodian): gating Decrypt on the instance role and PCRs, revoking Encrypt..." >&2
 
-# Print the PCR values about to be committed to the irreversible policy so the
-# Custodian can verify they match the intended AMI before the ratchet closes.
+# Print PCRs before the irreversible swap so the Custodian can verify against the intended AMI.
 echo "PCR values that will be gated in the final KMS policy (verify against your AMI):" >&2
 jq -r '.Measurements | to_entries | map(select(.key | test("^PCR[0-9]+"))) | .[] | "  \(.key): \(.value)"' \
   "$PCR_DIR/tpm_pcr.json" >&2

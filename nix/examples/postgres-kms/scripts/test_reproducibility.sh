@@ -1,18 +1,7 @@
 #!/bin/bash
 # shellcheck disable=SC2317  # helper functions are called indirectly (trap / run_step)
-#
-# Tests reproducibility of the postgres-kms image builds.
-#
-#   Test 1 - PCR4 reproducibility: two nix builds from the same locked flake
-#            produce identical unsigned UKI measurements.
-#   Test 2 - PCR7 reproducibility (identity reuse): same identity, ESLs rebuilt
-#            twice -> PCR7 identical. Proves the --secrets-manager path is
-#            deterministic.
-#   Test 3 - PCR7 is image-independent: same identity, two differently-mutated
-#            UKIs -> PCR4 differs, PCR7 identical.
-#
-# None of these tests call AWS. Usage:
-#   ./scripts/test_reproducibility.sh [--debug]
+# Tests PCR4/PCR7 reproducibility (3 scenarios). No AWS calls. Usage:
+# ./scripts/test_reproducibility.sh [--debug]
 
 set -u
 
@@ -20,17 +9,16 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 PROJECT_DIR="$( cd "$SCRIPT_DIR/.." &> /dev/null && pwd )"
 TEST_DIR="$PROJECT_DIR/.test-repro"
 
-# Nothing here needs root, and a single-user nix store belongs to the installing user:
-# building as root writes root-owned paths into it, which breaks later unprivileged builds.
-# A daemon install keeps /nix/store root-owned, so only refuse the single-user case.
+# Single-user nix: building as root writes root-owned store paths, breaking later unprivileged
+# builds.
+# Daemon installs keep /nix/store root-owned; only refuse the single-user case.
 if [ "$(id -u)" -eq 0 ] && [ "$(stat -c %U /nix/store 2>/dev/null)" != "root" ]; then
   echo "Error: refusing to build as root against a single-user /nix/store." >&2
   echo "       No test in this script needs root. Rerun without sudo." >&2
   exit 1
 fi
 
-# A non-login shell (ssh 'cmd', a script) does not source the nix profile, so the bare
-# `nix` calls below would be "command not found" despite nix being installed.
+# Non-login shells don't source the nix profile; add it to PATH if present.
 if ! command -v nix >/dev/null 2>&1 && [ -x "$HOME/.nix-profile/bin/nix" ]; then
   PATH="$HOME/.nix-profile/bin:$PATH"
 fi
@@ -111,7 +99,6 @@ assert_pcr_differ() {
   fi
 }
 
-# Generate a one-time identity (PK/KEK/db keys + certs + fixed GUID).
 generate_identity() {
   local out_dir="$1"
   mkdir -p "$out_dir"
@@ -128,7 +115,6 @@ generate_identity() {
   chmod 0600 "$out_dir/PK.key" "$out_dir/KEK.key" "$out_dir/db.key"
 }
 
-# Rebuild ESLs from the persisted certs + fixed GUID (the --secrets-manager model).
 prepare_keys_from_identity() {
   local dest="$1" identity="$2"
   mkdir -p "$dest"
@@ -146,7 +132,6 @@ prepare_keys_from_identity() {
   chmod 0600 "$dest/db.key"
 }
 
-# Copy the unsigned build output into an isolated writable dir.
 prepare_image_dir() {
   local src="$1" out_dir="$2"
   rm -rf "$out_dir"
@@ -155,7 +140,6 @@ prepare_image_dir() {
   chmod -R u+w "$out_dir"
 }
 
-# Mutate the unsigned UKI so PCR4 changes between runs.
 mutate_uki() {
   local image_dir="$1" marker="$2"
   nix --extra-experimental-features nix-command --extra-experimental-features flakes shell \
@@ -170,7 +154,6 @@ mutate_uki() {
   " >/dev/null
 }
 
-# Sign the UKI and capture PCR4+PCR7.
 sign_and_compute_pcrs() {
   local image_dir="$1" keys_dir="$2"
   nix --extra-experimental-features nix-command --extra-experimental-features flakes \

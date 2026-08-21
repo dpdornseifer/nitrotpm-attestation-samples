@@ -1,9 +1,6 @@
 #!/bin/bash
-# One-time bootstrap of the five provisioning roles, so the separation of duties is
-# enforced by IAM rather than by convention. NOT part of the ceremony: this needs
-# iam:CreateRole + iam:PutRolePolicy, which no provisioning role holds.
-#
-# Idempotent: an existing role has its inline policy refreshed rather than failing.
+# One-time bootstrap of the five provisioning roles (needs iam:CreateRole, outside the ceremony).
+# Idempotent: existing roles have their inline policy refreshed.
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -37,7 +34,6 @@ while [[ "$#" -gt 0 ]]; do
   shift
 done
 
-# One STS call: both fields come from the same response.
 CALLER_IDENTITY=$(aws sts get-caller-identity --output json)
 CALLER_ARN=$(jq -r '.Arn' <<<"$CALLER_IDENTITY")
 ACCOUNT_ID=$(jq -r '.Account' <<<"$CALLER_IDENTITY")
@@ -49,13 +45,11 @@ if ! TRUST_PRINCIPAL=$(normalize_admin_principal "$CALLER_ARN"); then
   exit 1
 fi
 
-# Build with jq so no inline policy literal appears in this file (the tests enforce
-# that all IAM permission policies come from lib/role-policies.sh).
+# All permission policies come from lib/role-policies.sh (enforced by tests).
 TRUST_POLICY=$(jq -n --arg p "$TRUST_PRINCIPAL" \
   '{Version:"2012-10-17",Statement:[{Effect:"Allow",Principal:{AWS:$p},Action:"sts:AssumeRole"}]}')
 
-# Create (or refresh) one role with a single inline policy read from stdin.
-# Args: <role_name> <policy_name> <description>.
+# Creates or refreshes one role, inline policy from stdin. Args: role_name policy_name description.
 create_role_with_policy() {
   local role_name="$1" policy_name="$2" description="$3" policy_doc
   policy_doc=$(cat)
@@ -87,7 +81,7 @@ CUSTODIAN_ARN=$(build_custodian_policy | create_role_with_policy \
   "${PREFIX}CustodianRole" "KeyCustodian" "NitroTPM key custodian: creates and finalizes the KMS key")
 PROVISIONER_ARN=$(build_provisioner_policy | create_role_with_policy \
   "${PREFIX}ProvisionerRole" "SecretsProvisioner" "NitroTPM secrets/PKI provisioner: wraps the DEK and issues certs")
-DEPLOYER_ARN=$(build_deployer_policy | create_role_with_policy \
+DEPLOYER_ARN=$(build_deployer_policy "$ACCOUNT_ID" | create_role_with_policy \
   "${PREFIX}DeployerRole" "ReleaseEngineer" "NitroTPM deployer: builds, signs and registers the AMI")
 OPERATOR_ARN=$(build_operator_policy "$ACCOUNT_ID" "$INSTANCE_ROLE_NAME" "$INSTANCE_PROFILE_NAME" \
   | create_role_with_policy \

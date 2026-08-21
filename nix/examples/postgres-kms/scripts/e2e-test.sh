@@ -302,9 +302,7 @@ fi
 echo "AWS credentials are valid."
 
 phase1() {
-  # Stage order is not the old step order: instance-role creation moves first
-  # because KMS validates key-policy principals (lib/kms.sh retries on "invalid
-  # principals"), so the role must exist before stage 5.
+  # Role must exist before stage 5; see prepare-role.sh for why.
   if [ "$CREATE_ROLES" = true ]; then
     echo "Stage 0: Creating the five provisioning roles..."
     OUTPUT=$("$SCRIPT_DIR/steps/00_create_roles.sh") || { echo "Role creation failed"; return 1; }
@@ -321,10 +319,8 @@ phase1() {
     sleep 10
   fi
 
-  # Persisted so clean.sh can schedule key deletion as the Custodian (it reads
-  # CUSTODIAN_ROLE_ARN directly from resources.json). Other role ARNs are NOT read
-  # back on --start-phase resume: they fall back to ambient credentials via
-  # assume_role_exec's empty-ARN passthrough.
+  # CUSTODIAN_ROLE_ARN persisted so clean.sh can assume it for key deletion.
+  # Other role ARNs aren't read back on --start-phase resume; empty ARN = ambient creds.
   [ -n "$CUSTODIAN_ROLE_ARN" ] && update_resource "CUSTODIAN_ROLE_ARN" "$CUSTODIAN_ROLE_ARN"
   [ -n "$PROVISIONER_ROLE_ARN" ] && update_resource "PROVISIONER_ROLE_ARN" "$PROVISIONER_ROLE_ARN"
   [ -n "$DEPLOYER_ROLE_ARN" ] && update_resource "DEPLOYER_ROLE_ARN" "$DEPLOYER_ROLE_ARN"
@@ -456,7 +452,6 @@ phase2() {
   retrieve_client_certs || return 1
   wait_for_postgresql_mtls "$PUBLIC_IP" "$TIMEOUT" || return 1
 
-  # Verify SELECT 1 via mTLS
   echo "Verifying PostgreSQL with SELECT 1 (mTLS)..."
   RESULT=$(run_sql_mtls "$PUBLIC_IP" "SELECT 1;")
   [ "$(echo "$RESULT" | tr -d '[:space:]')" = "1" ] || { echo "SELECT 1 failed (mTLS): got '$RESULT'"; return 1; }
@@ -522,16 +517,18 @@ phase3() {
     retrieve_client_certs || return 1
   fi
 
+  # Assume the Operator role explicitly; ambient creds would pass even if the policy is too narrow.
   echo "Terminating first instance $INSTANCE_ID..."
-  aws ec2 terminate-instances --instance-ids "$INSTANCE_ID"
-  aws ec2 wait instance-terminated --instance-ids "$INSTANCE_ID"
+  assume_role_exec "$OPERATOR_ROLE_ARN" -- aws ec2 terminate-instances --instance-ids "$INSTANCE_ID"
+  assume_role_exec "$OPERATOR_ROLE_ARN" -- aws ec2 wait instance-terminated --instance-ids "$INSTANCE_ID"
   echo "First instance terminated."
 
   echo "Waiting for EBS volume to become available..."
-  aws ec2 wait volume-available --volume-ids "$VOLUME_ID"
+  assume_role_exec "$OPERATOR_ROLE_ARN" -- aws ec2 wait volume-available --volume-ids "$VOLUME_ID"
 
   echo "Launching second instance..."
-  OUTPUT=$(run_instance_step "$AMI_ID" "$INSTANCE_PROFILE_NAME" "$VOLUME_ID" "$VPC_ID_FLAG" "$DEBUG_FLAG")
+  OUTPUT=$(assume_role_exec "$OPERATOR_ROLE_ARN" -- \
+    run_instance_step "$AMI_ID" "$INSTANCE_PROFILE_NAME" "$VOLUME_ID" "$VPC_ID_FLAG" "$DEBUG_FLAG")
   INSTANCE_ID=$(echo "$OUTPUT" | grep -oP 'Instance ID: \K.*')
   PRIVATE_IP=$(echo "$OUTPUT" | grep -oP 'Private IP: \K.*')
   PUBLIC_IP=$(echo "$OUTPUT" | grep -oP 'Public IP: \K.*')
@@ -543,7 +540,6 @@ phase3() {
 
   wait_for_postgresql_mtls "$PUBLIC_IP" "$TIMEOUT" || return 1
 
-  # Verify persisted data via mTLS
   echo "Verifying persisted test data (mTLS)..."
   RESULT=$(run_sql_mtls "$PUBLIC_IP" "SELECT value FROM e2e_test WHERE value='persistence-check';")
   [ "$RESULT" = "persistence-check" ] || { echo "Persistence check failed (mTLS): got '$RESULT'"; return 1; }

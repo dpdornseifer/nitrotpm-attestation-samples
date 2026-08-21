@@ -35,7 +35,6 @@ if [ -z "${AMI_ID:-}" ] || [ -z "${INSTANCE_PROFILE_NAME:-}" ] || [ -z "${VOLUME
   usage
 fi
 
-# Determine instance type based on AMI architecture if not specified
 if [ -z "${INSTANCE_TYPE:-}" ]; then
   echo "Determining instance type based on AMI architecture..."
   AMI_ARCH=$(aws ec2 describe-images --image-ids "$AMI_ID" --query 'Images[0].Architecture' --output text)
@@ -51,7 +50,6 @@ else
   echo "Using specified instance type: $INSTANCE_TYPE"
 fi
 
-# Resolve VPC ID and CIDR
 if [ -z "$VPC_ID" ]; then
   VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query 'Vpcs[0].VpcId' --output text)
   echo "Using default VPC: $VPC_ID"
@@ -60,7 +58,6 @@ fi
 VPC_CIDR=$(aws ec2 describe-vpcs --vpc-ids "$VPC_ID" --query 'Vpcs[0].CidrBlock' --output text)
 echo "VPC CIDR: $VPC_CIDR"
 
-# Pick a subnet in the same AZ as the EBS volume
 VOLUME_AZ=$(aws ec2 describe-volumes --volume-ids "$VOLUME_ID" --query 'Volumes[0].AvailabilityZone' --output text)
 echo "EBS volume is in availability zone: $VOLUME_AZ"
 
@@ -69,7 +66,6 @@ SUBNET_ID=$(aws ec2 describe-subnets \
   --query 'Subnets[0].SubnetId' --output text)
 echo "Using subnet: $SUBNET_ID in $VOLUME_AZ"
 
-# Check if the security group exists in this VPC, if not create it
 if ! SG_ID=$(aws ec2 describe-security-groups \
     --filters "Name=group-name,Values=$SECURITY_GROUP_NAME" "Name=vpc-id,Values=$VPC_ID" \
     --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null) || [ "$SG_ID" = "None" ]; then
@@ -85,9 +81,8 @@ else
   echo "Security group already exists. Using existing group: $SG_ID"
 fi
 
-# Launch the EC2 instance in the same AZ as the volume. Always assign a public IP so
-# PostgreSQL mTLS is reachable from outside the VPC (caller allowlists its source IP on
-# 5432); --associate-public-ip-address guarantees it regardless of the subnet default.
+# Always assign a public IP: PostgreSQL mTLS must be reachable from outside the VPC;
+# --associate-public-ip-address overrides the subnet default.
 INSTANCE_OUTPUT=$(aws ec2 run-instances \
   --image-id "$AMI_ID" \
   --instance-type "$INSTANCE_TYPE" \
@@ -111,11 +106,9 @@ fi
 
 echo "EC2 instance launched successfully."
 
-# Wait for the instance to be in running state
 echo "Waiting for the instance to be in running state..."
 aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
 
-# Attach the EBS volume to the instance
 echo "Attaching EBS volume $VOLUME_ID to instance $INSTANCE_ID as /dev/xvdf..."
 aws ec2 attach-volume --volume-id "$VOLUME_ID" --instance-id "$INSTANCE_ID" --device /dev/xvdf
 

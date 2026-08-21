@@ -1,4 +1,6 @@
 #!/bin/bash
+# Teardown: no set -e by design — cleanup continues past failures so one stuck resource doesn't
+# orphan the rest.
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 ARTIFACTS_DIR="$SCRIPT_DIR/../artifacts"
@@ -36,9 +38,7 @@ echo "AWS credentials are valid. Proceeding with cleanup..."
 AMI_ID=$(jq -r '.AMI_ID // empty' "$RESOURCES_FILE")
 ROLE_NAME=$(jq -r '.ROLE_NAME // empty' "$RESOURCES_FILE")
 INSTANCE_PROFILE_NAME=$(jq -r '.INSTANCE_PROFILE_NAME // empty' "$RESOURCES_FILE")
-# Prefer the ARN. KMS_KEY_ID is the field older runs wrote, kept as a fallback so
-# a resources.json from before ARN pinning still gets its key scheduled for
-# deletion instead of silently orphaning it.
+# Prefer the ARN; KMS_KEY_ID is the legacy field from pre-pinning runs.
 KMS_KEY_ARN=$(jq -r '.KMS_KEY_ARN // .KMS_KEY_ID // empty' "$RESOURCES_FILE")
 INSTANCE_ID=$(jq -r '.INSTANCE_ID // empty' "$RESOURCES_FILE")
 SECURITY_GROUP_ID=$(jq -r '.SECURITY_GROUP_ID // empty' "$RESOURCES_FILE")
@@ -149,8 +149,7 @@ if [ -n "$INSTANCE_PROFILE_NAME" ] && [ -n "$ROLE_NAME" ]; then
 fi
 
 if [ -n "$KMS_KEY_ARN" ]; then
-  # Key deletion is the Custodian's, not the Operator's: the final policy grants
-  # ScheduleKeyDeletion to the Custodian alone. Passthrough when no ARN is given.
+  # Key deletion is the Custodian's alone: the final policy scopes ScheduleKeyDeletion to it.
   echo "Scheduling KMS key for deletion: $KMS_KEY_ARN"
   kms_err=""
   # shellcheck disable=SC2069  # 2>&1 >/dev/null is intentional: capture stderr, discard stdout
@@ -162,12 +161,18 @@ if [ -n "$KMS_KEY_ARN" ]; then
 fi
 
 if [ "$DELETE_PROVISIONING_ROLES" = true ]; then
-  # NOTE: deleting provisioning roles requires elevated IAM permissions (iam:GetRole,
-  # iam:DeleteRolePolicy, iam:DeleteRole on the NitroTpm* roles) that are NOT included
-  # in the Operator role policy. Failures here mean the provisioning roles remain and
-  # must be removed manually or with an appropriately privileged principal.
-  for PROV_ROLE in NitroTpmCustodianRole NitroTpmProvisionerRole NitroTpmDeployerRole \
-                   NitroTpmOperatorRole NitroTpmTestClientRole; do
+  # Needs IAM permissions the Operator lacks. Names come from recorded ARNs — hardcoding
+  # NitroTpm* would orphan other prefixes.
+  PROV_ROLES=$(jq -r '[.CUSTODIAN_ROLE_ARN, .PROVISIONER_ROLE_ARN, .DEPLOYER_ROLE_ARN,
+                       .OPERATOR_ROLE_ARN, .TEST_CLIENT_ROLE_ARN]
+                      | map(select(. != null)) | map(sub(".*/"; "")) | .[]' \
+                   "$RESOURCES_FILE")
+  # Runs predating the persisted ARNs recorded nothing; fall back to defaults.
+  if [ -z "$PROV_ROLES" ]; then
+    PROV_ROLES="NitroTpmCustodianRole NitroTpmProvisionerRole NitroTpmDeployerRole
+                NitroTpmOperatorRole NitroTpmTestClientRole"
+  fi
+  for PROV_ROLE in $PROV_ROLES; do
     if aws iam get-role --role-name "$PROV_ROLE" >/dev/null 2>&1; then
       for POLICY_NAME in $(aws iam list-role-policies --role-name "$PROV_ROLE" --query 'PolicyNames[]' --output text 2>/dev/null); do
         run_aws_command_optional iam delete-role-policy --role-name "$PROV_ROLE" --policy-name "$POLICY_NAME"
@@ -180,8 +185,7 @@ fi
 
 rm -rf "$SCRIPT_DIR/../sb-keys" "$SCRIPT_DIR/../signed-image"
 
-# Truncate rather than delete: git+file:// flake refs only see tracked paths;
-# empty = unpinned. Deleting would silently orphan a future build's key lookup.
+# Truncate not delete: git+file:// flake refs only see tracked paths; empty = unpinned.
 : > "$SCRIPT_DIR/../kms-key-arn.txt"
 
 

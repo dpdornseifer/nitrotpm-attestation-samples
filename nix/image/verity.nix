@@ -29,7 +29,6 @@ in {
       fsType = config.image.repart.partitions.${partitionIds.store}.repartConfig.Format;
     };
 
-    # bind-mount the store
     "/nix/store" = {
       device = "/usr/nix/store";
       fsType = "none";
@@ -40,7 +39,7 @@ in {
   image.repart = {
     verityStore = {
       enable = true;
-      # by default the module works with systemd-boot; for simplicity this image directly boots the UKI
+      # directly boots the UKI rather than systemd-boot
       inherit ukiPath;
     };
 
@@ -48,7 +47,6 @@ in {
 
     partitions = {
       ${partitionIds.esp} = {
-        # the UKI is injected into this partition by the verityStore module
         repartConfig = {
           Type = "esp";
           Format = "vfat";
@@ -75,14 +73,12 @@ in {
     };
   };
 
-  # don't create /usr/bin/env
-  # this would require some extra work on read-only /usr
-  # and it is not a strict necessity
+  # don't create /usr/bin/env — extra work on read-only /usr, not needed
   system.activationScripts.usrbinenv = lib.mkForce "";
 
   boot.kernelParams = [
     "panic=30"
-    "boot.panic_on_fail" # reboot the machine upon fatal boot issues
+    "boot.panic_on_fail"
     "lockdown=1"
     "console=ttyS0,115200n8"
     "console=tty0"

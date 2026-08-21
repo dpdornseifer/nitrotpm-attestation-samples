@@ -1,12 +1,7 @@
 #!/bin/bash
 # Stage 6 of 6 — PLATFORM OPERATOR.
-#
-# Creates the data volume, launches the instance and reports how to reach it.
-#
-# The Operator is blind to the data by construction: it holds no kms:Decrypt and no
-# secret read, and it never sees the DEK or the certificate bundles. All it hands the
-# instance is the ciphertext user-data written in stage 4. Only the instance role can
-# decrypt, and only when its PCRs match.
+# Creates the data volume, launches the instance. The Operator holds no kms:Decrypt
+# and never sees the DEK; all it provides the instance is ciphertext user-data.
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -54,9 +49,6 @@ while [[ "$#" -gt 0 ]]; do
   shift
 done
 
-# Individual checks so the error messages name the actual flags, not a mechanical
-# transformation of the variable name (INSTANCE_PROFILE_NAME → --instance-profile,
-# not --instance-profile-name).
 [ -n "$AMI_ID" ] || { echo "Error: --ami-id is required." >&2; usage; }
 [ -n "$INSTANCE_PROFILE_NAME" ] || { echo "Error: --instance-profile is required." >&2; usage; }
 
@@ -86,9 +78,8 @@ if [ -z "$VOLUME_ID" ]; then
 fi
 
 echo "Stage 6/6 (Operator): launching the instance..." >&2
-# bash -c because assume_role_exec runs a command, not a shell function. Exporting the
-# credentials into the current shell instead would leave the wrong ones active if a
-# mid-stage failure skipped the restore.
+# bash -c: assume_role_exec takes a command, not a function; exporting creds to the current
+# shell would leave wrong ones active on failure.
 if ! INSTANCE_OUTPUT=$(assume_role_exec "$OPERATOR_ROLE_ARN" -- \
       bash -c ". '$SCRIPT_DIR/lib/identity.sh'; run_instance_step '$AMI_ID' '$INSTANCE_PROFILE_NAME' '$VOLUME_ID' '$VPC_ID_FLAG' '$DEBUG_FLAG'"); then
   echo "Error: instance launch failed." >&2
@@ -113,8 +104,6 @@ echo "PRIVATE_IP: $PRIVATE_IP"
 echo "PUBLIC_IP: $PUBLIC_IP"
 echo "SECURITY_GROUP_ID: $SG_ID"
 
-# Ported from the former postgres-kms start.sh (deleted in the six-stage refactor):
-# without this an operator has no idea how to reach the database that was just launched.
 {
   echo ""
   echo "=== Deployment summary ==="

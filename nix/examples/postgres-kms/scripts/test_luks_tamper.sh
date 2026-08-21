@@ -1,11 +1,8 @@
 #!/bin/bash
 #
-# Integration test for luks-verify.sh against real cryptsetup output (not fixtures).
-# Formats real loopback volumes; proves fixtures model reality.
-#
-# Vol A: pinned format -> ACCEPT  Vol B: integrity omitted -> REJECT  Vol C: unexpected cipher -> REJECT
-# Requires: Linux, root, dm-integrity, cryptsetup, jq.
-# Usage: sudo ./scripts/test_luks_tamper.sh [/path/to/cryptsetup]
+# Integration test: real loopback volumes vs luks-verify.sh, proving fixtures model reality.
+# Vols A-D: pinned ACCEPT, no-integrity REJECT, wrong-cipher REJECT, first-boot+rollback sequence.
+# Requires: Linux, root, dm-integrity, cryptsetup, jq. Usage: sudo $0 [/path/to/cryptsetup]
 
 set -u
 
@@ -44,7 +41,8 @@ trap cleanup EXIT
 
 head -c 32 /dev/urandom | base64 > "$KEYFILE"
 
-# new_loop sets $LOOP_DEV (not echoed for capture: subshell would lose $LOOPS append, leaking loop devices).
+# new_loop sets $LOOP_DEV (not echoed for capture: subshell would lose $LOOPS append, leaking
+# loop devices).
 new_loop() {
   local img="$WORK/$1.img"
   truncate -s 64M "$img"
@@ -137,7 +135,8 @@ fi
 
 echo
 
-# Volume D: format+open+mkfs is non-atomic; rollback zeroes LUKS2 metadata so isLuks fails and init retries.
+# Volume D: format+open+mkfs is non-atomic; rollback zeroes LUKS2 metadata so isLuks fails and
+# init retries.
 echo "=== Volume D: first-boot sequence then rollback ==="
 new_loop d || exit 1
 LOOP_D=$LOOP_DEV

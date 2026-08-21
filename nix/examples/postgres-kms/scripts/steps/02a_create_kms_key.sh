@@ -1,10 +1,8 @@
 #!/bin/bash
-# Phase one of two-step KMS provisioning: create the key under a bootstrap policy and
-# create the key and emit its ARN. build.sh (stage 3) owns pinning that ARN into the
-# image source, so the CLI value is the single source of truth. Encrypt lets 03 wrap
-# the DEK;
-# 02b then strips PutKeyPolicy + Encrypt. ListGrants/RevokeGrant let 02b detect and clear
-# any grant planted in this window (grants bypass the PCR policy) and persist for audit.
+# Phase one of two-step KMS provisioning: create the key and emit its ARN.
+# build.sh pins that ARN into the image, so the CLI value is the single source of truth.
+# Bootstrap policy: Custodian gets PutKeyPolicy, Provisioner gets Encrypt, neither gets
+# Decrypt. 02b strips both; Custodian's ListGrants/RevokeGrant let 02b clear any grant.
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -50,7 +48,8 @@ if [ -n "$PROVISIONER_ROLE" ]; then
   fi
 fi
 
-# No IAM delegation statement, so --bypass-policy-lockout-safety-check is required (same as the final policy).
+# No IAM delegation statement, so --bypass-policy-lockout-safety-check is required (same as the
+# final policy).
 BOOTSTRAP_POLICY=$(build_bootstrap_policy "$ADMIN_PRINCIPAL" "$PROVISIONER_PRINCIPAL")
 
 POLICY_FILE=$(mktemp -t kms_bootstrap_policy.XXXXXX.json)
@@ -58,7 +57,7 @@ trap 'rm -f "$POLICY_FILE"' EXIT
 echo "$BOOTSTRAP_POLICY" > "$POLICY_FILE"
 echo "Bootstrap KMS policy written to $POLICY_FILE"
 
-echo "Creating KMS key with bootstrap policy (Encrypt + PutKeyPolicy, no Decrypt)..."
+echo "Creating KMS key with bootstrap policy (Custodian: PutKeyPolicy; Provisioner: Encrypt; no Decrypt)..."
 if ! KEY_OUTPUT=$(kms_call_with_retry "KMS key creation" create-key \
       --description "NitroTPM attestation example key" \
       --bypass-policy-lockout-safety-check \

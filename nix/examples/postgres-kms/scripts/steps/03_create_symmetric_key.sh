@@ -25,8 +25,8 @@ if [ -z "$KMS_KEY_ARN" ]; then
   usage
 fi
 
-# Must be the full ARN: kms-init matches it against the ARN pinned into the image
-# by exact string equality, so a bare key id would pass here and fail every boot.
+# Must be full ARN: kms-init matches by exact string equality; a bare key id passes here and
+# fails every boot.
 if [[ "$KMS_KEY_ARN" != arn:aws*:kms:*:key/* ]]; then
   echo "Error: '$KMS_KEY_ARN' is not a full KMS key ARN." >&2
   echo "       Expected arn:aws:kms:<region>:<account>:key/<uuid> — the instance" >&2
@@ -52,7 +52,6 @@ echo "Symmetric key encrypted with KMS."
 
 ENCRYPTED_KEY=$(base64 -w 0 "$ARTIFACTS_DIR/encrypted_key.bin")
 
-# key_id carries the full ARN — instance checks it against the ARN pinned in the image.
 cat << EOF > "$ARTIFACTS_DIR/user_data.json"
 {
   "key_id": "${KMS_KEY_ARN}",

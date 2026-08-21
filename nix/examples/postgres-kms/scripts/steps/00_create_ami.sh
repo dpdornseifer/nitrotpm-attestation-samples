@@ -1,14 +1,16 @@
 #!/bin/bash
 #
-# Builds the raw image and registers an AMI from it. With --secure-boot, the
-# UKI is signed post-build via sign-efi-image (db.key never enters the nix
-# store) and the AMI is registered with the matching UEFI variable store.
+# Builds the raw image and registers an AMI. With --secure-boot the UKI is signed
+# post-build via sign-efi-image, so db.key never enters the nix store.
 
 set -uo pipefail
 
 SECURE_BOOT=false
 DEBUG=false
 IDENTITY_ARN=""
+# Adopted around the AWS calls only, never the nix build: STS caps a session at 1h
+# and a cold build can outlast it.
+ROLE_ARN=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --secure-boot)
@@ -23,6 +25,10 @@ while [[ $# -gt 0 ]]; do
       IDENTITY_ARN="$2"
       shift 2
       ;;
+    --role-arn)
+      ROLE_ARN="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown option $1"
       exit 1
@@ -32,12 +38,13 @@ done
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 PROJECT_DIR="$( cd "$SCRIPT_DIR/../.." &> /dev/null && pwd )"
+# shellcheck source=../lib/roles.sh
+. "$SCRIPT_DIR/../lib/roles.sh"
 cd "$PROJECT_DIR" || exit 1
 
 PACKAGE_NAME="raw-image"
 [ "$DEBUG" = true ] && PACKAGE_NAME="${PACKAGE_NAME}-debug"
 
-# Secure boot requires the sb-keys directory (populated by the caller)
 if [ "$SECURE_BOOT" = true ]; then
   if [ ! -d "sb-keys" ]; then
     echo "Error: secure boot requested but sb-keys/ directory is missing."
@@ -81,11 +88,13 @@ if [ "$SECURE_BOOT" = true ]; then
   cp -r result/. "$WORK_DIR/"
   chmod -R u+w "$WORK_DIR"
 
-  # sign-efi-image prints the full PCR set (PCR4 + PCR7) to stdout
+  # Prints PCR4+PCR7 to stdout. Needs the role: --identity-arn reads db.key from Secrets
+  # Manager, gated to the Deployer.
   SIGN_ARGS=("$WORK_DIR" "$PROJECT_DIR/sb-keys")
   [ -n "$IDENTITY_ARN" ] && SIGN_ARGS+=(--identity-arn "$IDENTITY_ARN")
-  nix --extra-experimental-features nix-command --extra-experimental-features flakes \
-    run .#sign-efi-image -- "${SIGN_ARGS[@]}" \
+  assume_role_exec "$ROLE_ARN" -- \
+    nix --extra-experimental-features nix-command --extra-experimental-features flakes \
+      run .#sign-efi-image -- "${SIGN_ARGS[@]}" \
     > "$WORK_DIR/tpm_pcr.json"
   SIGN_RC=$?
 
@@ -103,12 +112,14 @@ if [ "$SECURE_BOOT" = true ]; then
   fi
 
   echo "Creating UKI AMI from signed image..."
-  nix --extra-experimental-features nix-command --extra-experimental-features flakes \
-    run .#create-ami -- "$RAW_IMAGE" "$WORK_DIR/uefi_data.aws"
+  assume_role_exec "$ROLE_ARN" -- \
+    nix --extra-experimental-features nix-command --extra-experimental-features flakes \
+      run .#create-ami -- "$RAW_IMAGE" "$WORK_DIR/uefi_data.aws"
 else
   echo "Creating UKI AMI..."
-  nix --extra-experimental-features nix-command --extra-experimental-features flakes \
-    run .#create-ami -- result/nixos-tee_1.raw
+  assume_role_exec "$ROLE_ARN" -- \
+    nix --extra-experimental-features nix-command --extra-experimental-features flakes \
+      run .#create-ami -- result/nixos-tee_1.raw
 fi
 
 # shellcheck disable=SC2181  # $? needed: checks the last command in an if/else block above

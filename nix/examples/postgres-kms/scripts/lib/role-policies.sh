@@ -1,20 +1,11 @@
 #!/bin/bash
 #
-# Minimal IAM policy documents for the five provisioning roles, derived by
-# partitioning README's "Minimal IAM Privileges" monolith along stage ownership.
-#
-# This file is the single source of truth for those policies; the README carries
-# the single-identity/zero-config policy and links here for the per-role split.
-#
-# Three deliberate deviations from the README monolith:
-#   1. iam:PutRolePolicy is dropped — dead since 0307043.
-#   2. The Operator's IAM actions are resource-scoped. CreateRole + PassRole +
-#      RunInstances in one policy is an escalation chain (create a role with any
-#      permissions, pass it to an instance you launch), and all three land on the
-#      Operator, so the IAM half is pinned to the instance role and profile.
-#   3. ec2:DeleteSnapshot is added — clean.sh:85 needs it and the monolith omits it.
+# IAM policy documents for the five provisioning roles. Source of truth for the per-role split.
+# Operator IAM: CreateRole+PassRole+RunInstances is an escalation chain; pinning role alone
+# still lets
+# AttachRolePolicy install AdministratorAccess. Attach/Detach need a separate statement because
+# the other actions don't populate iam:PolicyARN (shared condition would deny them).
 
-# Args: <account_id> <instance_role_name> <instance_profile_name>.
 build_operator_policy() {
   local acct="$1" role_name="$2" profile_name="$3"
   cat <<EOF
@@ -69,13 +60,25 @@ build_operator_policy() {
         "iam:DeleteRole",
         "iam:GetRole",
         "iam:PassRole",
-        "iam:AttachRolePolicy",
-        "iam:DetachRolePolicy",
         "iam:ListAttachedRolePolicies",
         "iam:ListRolePolicies",
         "iam:DeleteRolePolicy"
       ],
       "Resource": "arn:aws:iam::${acct}:role/${role_name}"
+    },
+    {
+      "Sid": "AttachOnlyTheSsmManagedPolicyToTheWorkloadRole",
+      "Effect": "Allow",
+      "Action": [
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::${acct}:role/${role_name}",
+      "Condition": {
+        "ArnEquals": {
+          "iam:PolicyARN": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        }
+      }
     },
     {
       "Sid": "InstanceProfileLifecycleScoped",
@@ -95,7 +98,10 @@ build_operator_policy() {
       "Action": [
         "secretsmanager:DeleteSecret"
       ],
-      "Resource": "*"
+      "Resource": [
+        "arn:aws:secretsmanager:*:${acct}:secret:postgres-kms/client-cert-*",
+        "arn:aws:secretsmanager:*:${acct}:secret:nitrotpm-sb-identity-*"
+      ]
     },
     {
       "Sid": "SSMDebugAccess",
@@ -121,8 +127,8 @@ build_operator_policy() {
 EOF
 }
 
-# The key ARN does not exist when this role is created, so KMS actions cannot be
-# resource-scoped here; the key policy is the binding control.
+# KMS actions can't be resource-scoped here: key ARN doesn't exist at role-creation time. Key
+# policy is the binding control.
 build_custodian_policy() {
   cat <<'EOF'
 {
@@ -162,8 +168,11 @@ build_custodian_policy() {
 EOF
 }
 
+# Scoped to nitrotpm-sb-identity-* only (SM appends a suffix, hence *); Deployer can't read
+# client mTLS bundle. Args: <account_id>.
 build_deployer_policy() {
-  cat <<'EOF'
+  local acct="$1"
+  cat <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -197,7 +206,7 @@ build_deployer_policy() {
         "secretsmanager:PutResourcePolicy",
         "secretsmanager:GetResourcePolicy"
       ],
-      "Resource": "*"
+      "Resource": "arn:aws:secretsmanager:*:${acct}:secret:nitrotpm-sb-identity-*"
     },
     {
       "Sid": "STSIdentity",
@@ -246,9 +255,8 @@ build_provisioner_policy() {
 EOF
 }
 
-# Scoped to the client-cert secret name pattern written by 05a:115 so this role
-# cannot read the signing identity (named nitrotpm-sb-identity-*).
-# Args: <account_id>.
+# Scoped to postgres-kms/client-cert-* so this role can't read the signing identity
+# (nitrotpm-sb-identity-*). Args: <account_id>.
 build_test_client_policy() {
   local acct="$1"
   cat <<EOF

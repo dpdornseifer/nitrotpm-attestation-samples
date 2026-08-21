@@ -1,18 +1,11 @@
 #!/bin/bash
 #
-# Credential resolution shared by every ceremony stage. Ported from the former
-# postgres-kms start.sh (deleted in the six-stage refactor), which resolved these
-# before running any step. It lives in a library
-# because each stage runs standalone under its own operator's shell, so no single
-# orchestrator can do it on everyone's behalf.
-#
-# Why export rather than rely on the SDK's default chain: assume_role_exec runs the
-# command in a subshell with explicit credential variables, and stage scripts invoke
-# other scripts, so the region in particular must be present in the environment
-# rather than only in ~/.aws/config.
+# Credential resolution for ceremony stages. Exported (not SDK default chain): assume_role_exec
+# runs in a subshell with explicit env vars, so region must be in the environment, not only
+# ~/.aws/config.
 
-# Resolve one variable from the environment, else from `aws configure get <key>`.
-# Args: <var_name> <aws_config_key>. Returns 1 if neither yields a value.
+# Resolve var from env or 'aws configure get'. Returns 1 if neither yields a value. Args:
+# <var_name> <aws_config_key>.
 _resolve_one() {
   local var_name="$1" config_key="$2" current value
   current="${!var_name:-}"
@@ -31,8 +24,7 @@ _resolve_one() {
   return 1
 }
 
-# Ensure the three required AWS variables are exported, plus the session token when
-# one is available. Returns 1 naming the first variable that cannot be resolved.
+# Export required AWS creds; session token is optional. Returns 1 on first unresolvable variable.
 resolve_aws_credentials() {
   local pairs=(
     "AWS_ACCESS_KEY_ID aws_access_key_id"

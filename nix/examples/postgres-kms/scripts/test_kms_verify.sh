@@ -1,7 +1,8 @@
 #!/bin/bash
 #
 # Unit tests for kms-verify.sh — guards the gate that pins the KMS key ARN into the image,
-# blocking an operator from launching the genuine AMI against an attacker-controlled key via user-data.
+# blocking an operator from launching the genuine AMI against an attacker-controlled key via
+# user-data.
 # Pure (pinned, supplied) -> verdict tests: bash only, no jq, no AWS.
 
 set -u
@@ -25,7 +26,8 @@ fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); printf "${RED}FAIL${RESET} %s\n" "$1"; 
 
 # Exit-code contract: 0 = accept, 1 = reject.
 # Any other status is a harness or environment error, never a valid rejection.
-# Treating "reject" as "non-zero" would let a missing function (127) satisfy every rejection case vacuously.
+# Treating "reject" as "non-zero" would let a missing function (127) satisfy every rejection
+# case vacuously.
 
 assert_accepts() {
   local name=$1 pinned=$2 supplied=$3 err rc
@@ -47,7 +49,8 @@ assert_rejects() {
   esac
 }
 
-# assert_rejects_because: pins the reason, not just the verdict — wrong reason sends operators chasing the wrong thing.
+# assert_rejects_because: pins the reason, not just the verdict — wrong reason sends operators
+# chasing the wrong thing.
 assert_rejects_because() {
   local name=$1 pinned=$2 supplied=$3 want=$4 err rc
   err=$(kms_verify_pinned_key_id "$pinned" "$supplied" 2>&1); rc=$?
@@ -71,7 +74,8 @@ ALIAS_ARN="arn:aws:kms:us-east-1:123456789012:alias/nitrotpm-example"
 
 assert_accepts "accepts the exact pinned ARN" "$PINNED" "$PINNED"
 
-# Empty kms-key-arn.txt is the default for CI/local builds; must fail closed, not fall back to trusting user-data.
+# Empty kms-key-arn.txt is the default for CI/local builds; must fail closed, not fall back to
+# trusting user-data.
 
 assert_rejects_because "rejects an image built with no pinned ARN" \
   "" "$PINNED" "built without a pinned KMS key ARN"
@@ -91,11 +95,12 @@ assert_rejects_because "rejects a different key in the same account and region" 
 assert_rejects "rejects the same key id in a different region" "$PINNED" "$OTHER_REGION"
 assert_rejects "rejects the same key id in a different account" "$PINNED" "$OTHER_ACCOUNT"
 
-# UpdateAlias is mutable — accepting an alias would let the operator re-point the trust root without touching the image.
+# UpdateAlias is mutable — accepting an alias would let the operator re-point the trust root
+# without touching the image.
 assert_rejects "rejects an alias ARN for the pinned key" "$PINNED" "$ALIAS_ARN"
 
-# 03_create_symmetric_key.sh historically wrote a bare UUID (KeyMetadata.KeyId) into user_data.json — aws kms accepts it
-# upstream, but it carries no account/region so the comparison always fails. The error message must say why.
+# 03_create_symmetric_key.sh historically wrote a bare UUID; it has no account/region so the
+# check always fails.
 assert_rejects_because "rejects a bare key UUID and says why" \
   "$PINNED" "$BARE_UUID" "full ARN"
 
@@ -109,7 +114,8 @@ assert_rejects "rejects a value with the pinned ARN as a suffix" \
 assert_rejects "rejects a truncated prefix of the pinned ARN" \
   "$PINNED" "arn:aws:kms:us-east-1:123456789012:key/1a2b3c4d"
 
-# No normalisation: KMS returns one canonical form; case-folding or trimming widens the trust surface for no benefit.
+# No normalisation: KMS returns one canonical form; case-folding or trimming widens the trust
+# surface for no benefit.
 assert_rejects "rejects an ARN differing only in case" \
   "$PINNED" "$(printf '%s' "$PINNED" | tr '[:lower:]' '[:upper:]')"
 
@@ -117,9 +123,8 @@ assert_rejects "rejects an ARN with leading whitespace" "$PINNED" " $PINNED"
 assert_rejects "rejects an ARN with a trailing newline" "$PINNED" "$PINNED
 "
 
-# Source assertion: kms-init.nix must decrypt against PINNED_KMS_KEY_ARN, not the user-data value —
-# both are equal on the happy path so a swap is undetectable at runtime.
-
+# Source: must decrypt against the pinned ARN, not user-data — swap is undetectable at runtime
+# (canonical in kms-init.nix).
 KMS_INIT_NIX="$PROJECT_DIR/kms-init.nix"
 DECRYPT_LINE=$(grep -n 'nitro-tpm-kms-decrypt' "$KMS_INIT_NIX" 2>/dev/null)
 # shellcheck disable=SC2016  # the literal shell variable name is what we match

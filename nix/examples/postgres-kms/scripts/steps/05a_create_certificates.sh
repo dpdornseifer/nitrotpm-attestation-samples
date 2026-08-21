@@ -42,7 +42,6 @@ trap 'rm -rf "$CERT_TMPDIR"' EXIT
 
 echo "Generating certificates..."
 
-# Self-signed CA (RSA 4096, 3650 days)
 openssl req -x509 -newkey rsa:4096 -nodes \
   -keyout "$CERT_TMPDIR/ca.key" \
   -out "$CERT_TMPDIR/ca.crt" \
@@ -50,7 +49,6 @@ openssl req -x509 -newkey rsa:4096 -nodes \
   -subj "/CN=postgres-ca"
 echo "CA certificate generated."
 
-# Server certificate (RSA 2048, 825 days) signed by CA
 openssl req -newkey rsa:2048 -nodes \
   -keyout "$CERT_TMPDIR/server.key" \
   -out "$CERT_TMPDIR/server.csr" \
@@ -65,7 +63,6 @@ openssl x509 -req \
   -days 825
 echo "Server certificate generated."
 
-# Client certificate (RSA 2048, 825 days) signed by CA
 openssl req -newkey rsa:2048 -nodes \
   -keyout "$CERT_TMPDIR/client.key" \
   -out "$CERT_TMPDIR/client.csr" \
@@ -80,7 +77,6 @@ openssl x509 -req \
   -days 825
 echo "Client certificate generated."
 
-# Bundle server certs into a tarball and encrypt with the symmetric key
 tar -cf "$CERT_TMPDIR/server_bundle.tar" \
   -C "$CERT_TMPDIR" ca.crt server.crt server.key
 
@@ -92,7 +88,6 @@ echo "Server certificate bundle encrypted."
 
 cp "$CERT_TMPDIR/encrypted_server_bundle.bin" "$ARTIFACTS_DIR/encrypted_server_bundle.bin"
 
-# Base64-encode the encrypted bundle and add it to user_data.json
 SERVER_CERT_BUNDLE=$(base64 -w 0 "$CERT_TMPDIR/encrypted_server_bundle.bin")
 
 jq --arg bundle "$SERVER_CERT_BUNDLE" '. + {server_cert_bundle: $bundle}' \
@@ -100,7 +95,6 @@ jq --arg bundle "$SERVER_CERT_BUNDLE" '. + {server_cert_bundle: $bundle}' \
 mv "$CERT_TMPDIR/user_data_updated.json" "$USER_DATA_FILE"
 echo "user_data.json updated with server_cert_bundle."
 
-# Store the client bundle in Secrets Manager
 CA_CERT_B64=$(base64 -w 0 "$CERT_TMPDIR/ca.crt")
 CLIENT_CERT_B64=$(base64 -w 0 "$CERT_TMPDIR/client.crt")
 CLIENT_KEY_B64=$(base64 -w 0 "$CERT_TMPDIR/client.key")
@@ -124,7 +118,6 @@ echo "Client certificate bundle stored in Secrets Manager: $SECRET_ARN"
 # The instance never reads this secret (its server bundle arrives via user-data);
 # only the deployer/e2e client fetches it, so the instance role gets no grant here.
 
-# Record SECRET_ARN in resources.json
 RESOURCES_FILE="$ARTIFACTS_DIR/resources.json"
 if [ -f "$RESOURCES_FILE" ]; then
   jq --arg arn "$SECRET_ARN" '. + {SECRET_ARN: $arn}' "$RESOURCES_FILE" > "$CERT_TMPDIR/resources_updated.json"

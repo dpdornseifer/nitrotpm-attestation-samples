@@ -1,5 +1,4 @@
 # shellcheck shell=bash
-#
 # Pinned data-volume format. LUKS2 header checksums are unkeyed, so an operator can strip
 # integrity from segments[0] and luksOpen still succeeds — it only proves the key. Verify the
 # header and active mapping before trusting either. Sourced by luks-init.nix + test_luks_verify.sh.
@@ -18,8 +17,8 @@ LUKS_EXPECTED_INTEGRITY="hmac(sha256)"
 # 4096 gives dm-integrity write atomicity and matches PostgreSQL's 8 KiB pages.
 LUKS_EXPECTED_SECTOR_SIZE="4096"
 
-# Passed to luksFormat as well as asserted, so a future cryptsetup default cannot format
-# one way and be rejected on the next boot.
+# Passed to luksFormat and asserted: prevents a future cryptsetup default mismatch across
+# format/open.
 # shellcheck disable=SC2034  # consumed by luks-init.nix, which sources this file
 LUKS_EXPECTED_PBKDF="argon2id"
 
@@ -37,7 +36,8 @@ _luks_trim() {
   printf '%s' "$s"
 }
 
-# _luks_status_field <status-text> <exact-field-name> -- exact match prevents "integrity keysize" satisfying "keysize".
+# _luks_status_field <status-text> <exact-field-name> -- exact match prevents "integrity
+# keysize" satisfying "keysize".
 _luks_status_field() {
   local text=$1 want=$2 line key val
   while IFS= read -r line; do
@@ -56,7 +56,8 @@ EOF
   return 1
 }
 
-# luks_verify_header_json <luksDump --dump-json-metadata output> -- runs before luksOpen, needs no key.
+# luks_verify_header_json <luksDump --dump-json-metadata output> -- runs before luksOpen, needs
+# no key.
 luks_verify_header_json() {
   local meta=$1 out rc=0
 
@@ -97,7 +98,8 @@ luks_verify_header_json() {
   return 0
 }
 
-# luks_verify_status <cryptsetup status output> -- authoritative check; luksOpen only proves key correctness.
+# luks_verify_status <cryptsetup status output> -- authoritative check; luksOpen only proves
+# key correctness.
 luks_verify_status() {
   local text=$1 cipher keysize integrity sector_size expected_total
 
@@ -108,7 +110,8 @@ luks_verify_status() {
     return 1
   fi
 
-  # Integrity checked before keysize: no-integrity volume reports smaller keysize, masking the real failure.
+  # Integrity checked before keysize: no-integrity volume reports smaller keysize, masking the
+  # real failure.
   integrity=$(_luks_status_field "$text" integrity) \
     || { echo "luks-verify: data authentication is not active on the mapping" >&2; return 1; }
   if [ "$integrity" != "$LUKS_EXPECTED_INTEGRITY" ]; then

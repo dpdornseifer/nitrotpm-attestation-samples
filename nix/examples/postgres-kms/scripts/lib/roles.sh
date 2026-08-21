@@ -1,18 +1,13 @@
 #!/bin/bash
 #
-# Per-stage credential scoping for the role-separated ceremony. Each stage owns
-# exactly one role; this is how it adopts it.
-#
-# An empty role ARN is a passthrough. That is deliberately both the zero-config
-# path (no flags supplied, everything runs as the caller) and the production path:
-# in a real ceremony the Custodian's shell already holds Custodian credentials, so
-# a script assuming a role would be backwards.
-#
-# All diagnostics go to stderr: callers parse step-script stdout with grep -oP, so a
-# single stray stdout line breaks the parse silently.
+# Per-stage credential scoping. Empty role ARN is a passthrough: both the zero-config path
+# (no flags → run as caller) and the real-ceremony path (Custodian's shell already holds the
+# right creds).
+# All diagnostics go to stderr: eight call sites parse step-script stdout with grep -oP, so a
+# stray line breaks the parse.
 
-# Run a command under <role_arn>'s temporary credentials, or ambient credentials
-# when the ARN is empty. Args: <role_arn> [--] <cmd> [args...].
+# Run a command under <role_arn>'s creds, or ambient creds when ARN is empty. Args: <role_arn>
+# [--] <cmd> [args...].
 assume_role_exec() {
   local role_arn="${1:-}"
   shift || true
@@ -40,8 +35,7 @@ assume_role_exec() {
 
   echo "Assumed role: $role_arn" >&2
 
-  # Subshell so the exported credentials die with the command; the caller's
-  # ambient credentials are never mutated.
+  # Subshell: credentials die with the command, caller's ambient creds untouched.
   (
     AWS_ACCESS_KEY_ID=$(printf '%s' "$creds" | cut -f1)
     AWS_SECRET_ACCESS_KEY=$(printf '%s' "$creds" | cut -f2)
@@ -51,9 +45,8 @@ assume_role_exec() {
   )
 }
 
-# The principal to name in a key policy: the explicit role ARN, or the caller when
-# no flag was supplied (zero-config, where the caller IS that role).
-# Args: <role_arn_or_empty>.
+# Returns the explicit ARN, or caller's identity when ARN is empty (zero-config). Args:
+# <role_arn_or_empty>.
 resolve_policy_principal() {
   local arn="${1:-}"
   if [ -n "$arn" ]; then

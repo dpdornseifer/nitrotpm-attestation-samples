@@ -1,15 +1,7 @@
 #!/bin/bash
 # Stage 3 of 6 — RELEASE/BUILD ENGINEER (Deployer).
-#
-# Pins the key ARN into the measured image, then builds, signs and registers the AMI.
-# The Deployer owns the pin because it is a build input read at Nix eval, and a
-# git+file:// flake ref only sees tracked paths.
-#
-# The signing key never leaves this stage. The Deployer cannot finalize the key
-# policy — it holds no kms:PutKeyPolicy — so it emits the PCRs and stops. That
-# hand-off between two principals is what stops a rogue Deployer from gating the key
-# to its own image.
-#
+# Pins the key ARN, builds, signs and registers the AMI. The Deployer holds no
+# kms:PutKeyPolicy: it emits PCRs and stops — the Custodian alone gates the key.
 # No `set -x`: xtrace would echo secure-boot key material to stderr.
 set -euo pipefail
 
@@ -82,8 +74,6 @@ resolve_aws_credentials || exit 1
 mkdir -p "$ARTIFACTS_DIR"
 [ -f "$RESOURCES_FILE" ] || echo '{}' > "$RESOURCES_FILE"
 
-# Ported banners: these are the two ways a build silently stops being what the
-# reader assumes it is.
 if [ -n "$SECURE_BOOT_FLAG" ] && [ -z "$SECRET_MANAGER_FLAG" ]; then
   echo -e "\033[33m⚠️  WARNING: Secure boot builds are NOT reproducible (keys generated at build time)! ⚠️\033[0m" >&2
 fi
@@ -172,19 +162,19 @@ if [ -n "$SECURE_BOOT_FLAG" ]; then
 fi
 
 # --- build, sign, register ---------------------------------------------------
-# Build the args array conditionally: empty flag variables must contribute nothing.
-# The old string form relied on word-splitting to drop empties; a quoted array does not.
 CREATE_AMI_ARGS=()
 [ -n "$SECURE_BOOT_FLAG" ] && CREATE_AMI_ARGS+=("$SECURE_BOOT_FLAG")
 [ -n "$DEBUG_FLAG" ]       && CREATE_AMI_ARGS+=("$DEBUG_FLAG")
 if [ -n "$IDENTITY_ARN" ]; then
   CREATE_AMI_ARGS+=(--identity-arn "$IDENTITY_ARN")
 fi
+# Not wrapped around the step: 00_create_ami.sh adopts it per-call to avoid burning the 1h STS
+# window.
+[ -n "$DEPLOYER_ROLE_ARN" ] && CREATE_AMI_ARGS+=(--role-arn "$DEPLOYER_ROLE_ARN")
 
 echo "Stage 3/6 (Deployer): building, signing and registering the AMI..." >&2
 set +e
-AMI_OUTPUT=$(assume_role_exec "$DEPLOYER_ROLE_ARN" -- \
-  "$SCRIPT_DIR/steps/00_create_ami.sh" "${CREATE_AMI_ARGS[@]+"${CREATE_AMI_ARGS[@]}"}")
+AMI_OUTPUT=$("$SCRIPT_DIR/steps/00_create_ami.sh" "${CREATE_AMI_ARGS[@]+"${CREATE_AMI_ARGS[@]}"}")
 AMI_RC=$?
 set -e
 

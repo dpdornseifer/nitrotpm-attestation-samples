@@ -27,7 +27,6 @@
   programs.command-not-found.enable = lib.mkDefault false;
   programs.less.lessopen = lib.mkDefault null;
 
-    # Secure network defaults
   systemd.network = {
     enable = lib.mkDefault true;
     networks."10-secure" = {
@@ -44,10 +43,9 @@
     };
   };
 
-  # Disable auto-login
   services.getty.autologinUser = lib.mkForce null;
   services.sshd.enable = lib.mkForce false;
-  services.udisks2.enable = false; # udisks has become too bloated to have in a headless system
+  services.udisks2.enable = false;
 
   # An operator-attached EBS volume is auto-probed as root by udev, and pvscan parses its
   # metadata. Do NOT disable services.lvm to stop that: lvm2 also ships the generic
@@ -81,8 +79,6 @@
   system.switch.enable = lib.mkDefault false;
 
   users.mutableUsers = false;
-  # Remove root password
   users.users.root.hashedPassword = lib.mkForce null;
-  # Disable checking that at least the `root` user or a user in the `wheel` group can log in using a password or an SSH key
   users.allowNoPasswordLogin = lib.mkForce true;
 }

@@ -1,16 +1,11 @@
 #!/bin/bash
 #
-# Shared helpers (functions only) sourced by the ceremony stages and e2e-test.sh.
-#
-# The xtrace-suppression idiom in the secret-handling helpers is inlined on purpose:
-# a RETURN trap fires when the installing function returns, so a shared helper would
-# re-enable xtrace in the caller and leak key material.
+# Shared helpers sourced by ceremony stages. Xtrace suppression is inlined (not in a shared helper):
+# a RETURN trap fires when the installing function returns, re-enabling xtrace in the caller.
 
-# Resolved from this file's own location: deploy.sh sources it in an assume_role_exec
-# subshell where the caller's $SCRIPT_DIR is absent.
+# Resolved from this file's own location; deploy.sh runs in a subshell where $SCRIPT_DIR is absent.
 IDENTITY_SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
 
-# Validate the Secrets Manager ARN format; exits on mismatch.
 validate_secret_arn() {
   local arn="$1"
   if [[ "$arn" != arn:aws:secretsmanager:* ]]; then
@@ -19,8 +14,7 @@ validate_secret_arn() {
   fi
 }
 
-# Print the command the user must run to allowlist their host on 5432 (SG permits
-# only the VPC CIDR by default). Never edits the SG. Args: <sg_id>.
+# Print the command to allowlist the caller's host on 5432. Never edits the SG. Args: <sg_id>.
 print_sg_authorization_notice() {
   local sg_id="$1" my_ip
   my_ip=$(curl -s --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]')
@@ -46,8 +40,7 @@ print_sg_authorization_notice() {
   echo ""
 }
 
-# CI counterpart to the notice: allowlist the runner's public IP on 5432.
-# Idempotent (duplicate rule = success); fails hard if the IP is undetectable. Args: <sg_id>.
+# CI: allowlist runner's public IP on 5432; idempotent; fails if IP undetectable. Args: <sg_id>.
 authorize_my_ip() {
   local sg_id="$1" my_ip err
   if [ -z "$sg_id" ]; then
@@ -71,7 +64,6 @@ authorize_my_ip() {
   fi
 }
 
-# Atomically persist KEY=VALUE into $RESOURCES_FILE (caller's global).
 update_resource() {
   local KEY=$1
   local VALUE=$2
@@ -81,8 +73,8 @@ update_resource() {
   jq --arg key "$KEY" --arg value "$VALUE" '.[$key] = $value' "$RESOURCES_FILE" > "$tmp" && mv "$tmp" "$RESOURCES_FILE" || rm -f "$tmp"
 }
 
-# Echo the dir holding tpm_pcr.json for the KMS policy: signed-image/ (PCR4+PCR7)
-# when secure boot is active, else result/ (PCR4). Args: <project_dir> <secure_boot_flag>.
+# Returns signed-image/ (PCR4+PCR7) when secure boot active, else result/ (PCR4). Args:
+# <project_dir> <secure_boot_flag>.
 resolve_pcr_dir() {
   local project_dir="$1" secure_boot_flag="$2"
   if [ -n "$secure_boot_flag" ] && [ -f "$project_dir/signed-image/tpm_pcr.json" ]; then
@@ -92,9 +84,8 @@ resolve_pcr_dir() {
   fi
 }
 
-# Launch an instance via step 05 with the standard arg set (single source of truth for
-# deploy.sh and e2e-test.sh). vpc_id_flag/debug_flag are passed unquoted so a two-word
-# "--vpc-id X" splits into two args and an empty flag vanishes.
+# Single launch call-site for deploy.sh and e2e-test.sh.
+# vpc_id_flag/debug_flag intentionally unquoted: "--vpc-id X" must split, empty flag must vanish.
 # Args: <ami_id> <instance_profile> <volume_id> [vpc_id_flag] [debug_flag].
 run_instance_step() {
   local ami_id="$1" instance_profile="$2" volume_id="$3" vpc_id_flag="${4:-}" debug_flag="${5:-}"
@@ -102,8 +93,7 @@ run_instance_step() {
   "$IDENTITY_SCRIPTS_DIR/steps/05_run_instance.sh" -a "$ami_id" -p "$instance_profile" -v "$volume_id" $vpc_id_flag $debug_flag
 }
 
-# Generate the golden identity in memory and emit it as JSON on stdout:
-# {guid, db_key, db_crt, pk_crt, kek_crt}. No private key touches disk.
+# Generate {guid, db_key, db_crt, pk_crt, kek_crt} in memory; no private key touches disk.
 generate_identity_material() {
   # shellcheck disable=SC2016  # single-quoted heredoc-style arg: expansions run in the inner bash
   nix --extra-experimental-features nix-command --extra-experimental-features flakes shell \
@@ -121,9 +111,8 @@ generate_identity_material() {
   '
 }
 
-# Generate an ephemeral secure boot key hierarchy (PK, KEK, db + ESLs) into
-# <key_dir> and build the UEFI var store. Non-reproducible: PCR7 changes each
-# run. Args: <key_dir> <project_dir>.
+# Generate ephemeral SB keys (PK, KEK, db + ESLs) + UEFI var store. Non-reproducible: PCR7
+# changes each run. Args: <key_dir> <project_dir>.
 generate_local_sb_keys() {
   local key_dir="$1" project_dir="$2"
 
@@ -161,19 +150,12 @@ generate_local_sb_keys() {
   chmod 0600 "$key_dir/PK.key" "$key_dir/KEK.key" "$key_dir/db.key"
 }
 
-# Deny GetSecretValue to every principal except the Deployer.
-#
-# Must be a Deny: Secrets Manager grants access if EITHER the identity policy or the
-# resource policy allows, so an Allow-only policy would leave any principal holding
-# secretsmanager:GetSecretValue able to read the signing key, sign a rogue image and
-# — if it also runs finalize-key — gate Decrypt to those rogue PCRs single-handedly.
-#
-# Scoped to GetSecretValue alone: a blanket secretsmanager:* Deny would also block
-# DeleteSecret and break teardown (clean.sh:58-61 deletes this secret).
-#
-# ArnNotEquals because AWS recommends ARN operators for ARN comparisons, and
-# aws:PrincipalArn evaluates to the IAM role ARN — never the assumed-role session
-# ARN. Args: <deployer_role_arn>.
+# Deny GetSecretValue to all except Deployer. Must be Deny (not Allow): Secrets Manager grants
+# if either policy allows, so an Allow-only resource policy leaves any secretsmanager:GetSecretValue
+# holder able to read the signing key and gate Decrypt to rogue PCRs.
+# Scoped to GetSecretValue only — blanket Deny breaks DeleteSecret (clean.sh:58-61).
+# ArnNotEquals + aws:PrincipalArn: evaluates to the IAM role ARN, not the session ARN. Args:
+# <deployer_role_arn>.
 build_identity_resource_policy() {
   local deployer="$1"
   cat <<EOF
@@ -197,10 +179,8 @@ build_identity_resource_policy() {
 EOF
 }
 
-# Attach the Deployer-only read policy to a secret and verify it landed.
-# create-secret cannot attach a resource policy atomically, so there is an
-# unavoidable create->attach window; verifying afterwards is what closes it, the
-# same shape as 02b's post-finalize grant audit. Fails closed.
+# Attach Deployer-only resource policy and verify it landed. create-secret has no atomic attach,
+# so verify closes the create→attach window (same pattern as 02b's grant audit). Fails closed.
 # Args: <secret_arn> <deployer_role_arn>.
 lock_secret_to_deployer() {
   local arn="$1" deployer="${2:-}" policy readback
@@ -237,10 +217,9 @@ lock_secret_to_deployer() {
   echo "Signing identity $arn locked to $deployer." >&2
 }
 
-# Create a Secrets Manager secret from a file path (typically a process
-# substitution so the value never hits disk). Prints the ARN. When a Deployer ARN
-# is given, attaches and verifies the Deployer-only read policy before returning.
-# Args: <name> <src-path> [deployer_role_arn].
+# Create a Secrets Manager secret from a path (process substitution: value never hits disk).
+# Attaches Deployer-only policy when deployer ARN provided. Prints ARN. Args: <name> <src-path>
+# [deployer_role_arn].
 upload_secret() {
   local name="$1" src="$2" deployer="${3:-}" arn
   arn=$(aws secretsmanager create-secret \
@@ -252,9 +231,9 @@ upload_secret() {
   printf '%s\n' "$arn"
 }
 
-# Generate a fresh golden identity in memory and upload it as one JSON secret.
-# Persisting the full identity keeps ESL inputs byte-stable so PCR7 is reproducible.
-# Prints the secret ARN. Args: <name_prefix> [deployer_role_arn].
+# Generate and upload identity as one JSON secret. Full identity stored so ESL inputs stay
+# byte-stable across rebuilds (reproducible PCR7). Prints ARN. Args: <name_prefix>
+# [deployer_role_arn].
 generate_and_upload_identity() {
   # Suppress xtrace: identity_json carries the db private key
   case "$-" in *x*) trap 'set -x; trap - RETURN' RETURN; set +x ;; esac
@@ -287,9 +266,8 @@ generate_and_upload_identity() {
   printf '%s\n' "$arn"
 }
 
-# Rebuild the UEFI secure boot envelope (ESLs + uefi_data.aws) into <key_dir> from a
-# persisted golden identity. Only public fields hit disk; db_key stays in memory.
-# Byte-stable inputs make PCR7 reproducible. Args: <key_dir> <project_dir> <identity_arn>.
+# Rebuild ESLs + uefi_data.aws from persisted identity; db_key never hits disk. PCR7
+# reproducible. Args: <key_dir> <project_dir> <identity_arn>.
 rebuild_sb_envelope_from_identity() {
   # Suppress xtrace: the fetched identity JSON carries the db private key
   case "$-" in *x*) trap 'set -x; trap - RETURN' RETURN; set +x ;; esac

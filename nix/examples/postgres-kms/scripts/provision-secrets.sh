@@ -1,17 +1,8 @@
 #!/bin/bash
 # Stage 4 of 6 — SECRETS / PKI PROVISIONER.
-#
-# Mints and wraps the DEK, then issues the CA, server and client certificates and
-# encrypts the server bundle with that same DEK.
-#
-# Both steps consume the PLAINTEXT DEK, so both live in this one stage: the plaintext
-# dies when this process exits and never crosses a stage boundary. Only ciphertext
-# (artifacts/user_data.json) and the client-bundle secret ARN travel onward.
-#
-# The Provisioner holds kms:Encrypt but no kms:PutKeyPolicy, so it can wrap a DEK but
-# cannot rewrite the key policy — it cannot plant a grant. The Custodian is the
-# reverse. That is the split.
-#
+# Mints and wraps the DEK, issues certs, encrypts the server bundle — all in one
+# stage so the plaintext DEK never crosses a stage boundary.
+# Provisioner has kms:Encrypt but no kms:PutKeyPolicy; Custodian is the reverse.
 # No `set -x`: xtrace would echo the plaintext DEK.
 set -euo pipefail
 
@@ -48,9 +39,8 @@ done
 
 resolve_aws_credentials || exit 1
 
-# 0700 dir plus an EXIT trap: the trap is the part that matters, because a set -e
-# abort or a signal between mktemp and an explicit rm would otherwise leave the
-# plaintext DEK on disk.
+# EXIT trap: signal or set -e abort between mktemp and rm would otherwise leave the plaintext
+# DEK on disk.
 KEY_TMPDIR=$(mktemp -d)
 trap 'rm -rf "$KEY_TMPDIR"' EXIT INT TERM
 # mktemp -d already yields 0700; this is defence in depth against a permissive umask.
@@ -73,8 +63,7 @@ if ! CERT_OUTPUT=$(assume_role_exec "$PROVISIONER_ROLE_ARN" -- \
   exit 1
 fi
 
-# Destroy the plaintext as soon as the last consumer is done, rather than waiting
-# for the trap. The trap remains as the abort-path guarantee.
+# Destroy the plaintext eagerly; the trap remains as the abort-path guarantee.
 rm -f "$KEY_FILE"
 
 SECRET_ARN=$(printf '%s' "$CERT_OUTPUT" | grep -oP 'SECRET_ARN: \K.*' | head -n1)

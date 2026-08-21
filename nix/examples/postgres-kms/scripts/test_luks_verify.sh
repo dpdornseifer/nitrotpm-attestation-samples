@@ -22,7 +22,7 @@ FAIL_COUNT=0
 pass() { PASS_COUNT=$((PASS_COUNT + 1)); printf "${GREEN}PASS${RESET} %s\n" "$1"; }
 fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); printf "${RED}FAIL${RESET} %s\n" "$1"; }
 
-# Exit-code contract: 0 = accept, 1 = reject. Any other status is a harness error, not a valid rejection.
+# Exit-code contract: 0=accept, 1=reject; other codes are harness errors (see test_kms_verify.sh).
 
 assert_accepts() {
   local name=$1 fn=$2 input=$3 err rc
@@ -44,7 +44,8 @@ assert_rejects() {
   esac
 }
 
-# assert_rejects_because: pins the rejection reason — a check that rejects for the wrong reason is undetectable otherwise.
+# assert_rejects_because: pins the rejection reason — a check that rejects for the wrong reason
+# is undetectable otherwise.
 assert_rejects_because() {
   local name=$1 fn=$2 input=$3 want=$4 err rc
   err=$("$fn" "$input" 2>&1); rc=$?
@@ -88,7 +89,8 @@ header_json() {
 }
 
 # status_text <cipher> <keysize-value> [integrity-type]
-# Models `cryptsetup status data` output. keysize is COMBINED (512 XTS + 256 HMAC = 768); 2.8.x brackets units ("768 [bits]"), <=2.7.5 does not.
+# Models `cryptsetup status data` output. keysize is COMBINED (512 XTS + 256 HMAC = 768); 2.8.x
+# brackets units ("768 [bits]"), <=2.7.5 does not.
 status_text() {
   local cipher=$1 keysize=$2 integ=${3:-}
   printf '/dev/mapper/data is active.\n'
@@ -183,12 +185,14 @@ assert_rejects_because "status: rejects mapping with no integrity layer" \
   luks_verify_status "$(status_text aes-xts-plain64 '512 [bits]' '')" \
   "data authentication is not active"
 
-# 512 is the encryption-only key size; the mapping must report combined 768 — seeing 512 means no integrity key.
+# 512 is the encryption-only key size; the mapping must report combined 768 — seeing 512 means
+# no integrity key.
 assert_rejects_because "status: rejects encryption-only keysize (512, integrity key missing)" \
   luks_verify_status "$(status_text aes-xts-plain64 '512 [bits]' 'hmac(sha256)')" \
   "active keysize"
 
-# cryptsetup changed unit format at 2.8.x; key off the number, not the suffix, or a nixpkgs bump silently bricks the volume.
+# cryptsetup changed unit format at 2.8.x; key off the number, not the suffix, or a nixpkgs
+# bump silently bricks the volume.
 assert_accepts "status: accepts keysize rendered as '768 bits' (<= v2.7.5)" \
   luks_verify_status "$(status_text aes-xts-plain64 '768 bits' 'hmac(sha256)')"
 
@@ -199,7 +203,8 @@ assert_rejects_because "status: rejects wrong keysize in the older 'bits' format
   luks_verify_status "$(status_text aes-xts-plain64 '256 bits' 'hmac(sha256)')" \
   "active keysize"
 
-# A substring match reads 768 from "integrity keysize:" and passes; assert_rejects_because catches the wrong-reason case.
+# A substring match reads 768 from "integrity keysize:" and passes; assert_rejects_because
+# catches the wrong-reason case.
 assert_rejects_because "status: does not confuse 'integrity keysize:' with 'keysize:'" \
   luks_verify_status "$(printf '  cipher:  aes-xts-plain64\n  integrity keysize: 768 [bits]\n  keysize: 256 [bits]\n  integrity: hmac(sha256)\n')" \
   "active keysize"

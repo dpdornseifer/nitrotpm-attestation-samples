@@ -1,11 +1,11 @@
 #!/bin/bash
 #
 # Shared helpers for 02a_create_kms_key.sh and 02b_finalize_kms_policy.sh.
-# Two-step flow exists because the KMS key ARN must be pinned into the image (measured
-# into PCR4) before the build, but PCR-gated policy needs post-build PCRs — so 02a
-# bootstraps under PutKeyPolicy-only and 02b finalizes in one irreversible call.
+# Two-step: ARN must be pinned into the image before build (→ PCR4), but PCR-gated policy needs
+# post-build PCRs.
 
-# Assumed-role session ARNs (sts::…:assumed-role/…) are not valid KMS principals; resolve to the IAM role ARN.
+# Assumed-role session ARNs (sts::…:assumed-role/…) are not valid KMS principals; resolve to
+# the IAM role ARN.
 normalize_admin_principal() {
   local principal="$1"
 
@@ -18,14 +18,14 @@ normalize_admin_principal() {
   echo "$principal"
 }
 
-# Emit the bootstrap key policy on stdout. The Custodian gets policy control,
-# lifecycle and grant audit; the Provisioner gets Encrypt only. Splitting them means
-# no single party can both rewrite the policy (grant-plant) and mint ciphertext
-# (DEK substitution) during the bootstrap window.
-#
-# Collapses to the original single statement when the provisioner is absent or is
-# the same principal, so the zero-config path is byte-identical to the pre-split
-# policy. Args: <custodian_principal> [provisioner_principal].
+# Emit bootstrap key policy. Custodian gets policy control + grant audit; Provisioner gets
+# Encrypt only.
+# Split prevents any single party from rewriting the policy AND minting ciphertext during the
+# bootstrap window.
+# Collapses to a single statement when provisioner is absent or matches custodian, so the
+# zero-config
+# path is byte-identical to the pre-split policy. Args: <custodian_principal>
+# [provisioner_principal].
 build_bootstrap_policy() {
   local custodian="$1" provisioner="${2:-}"
 
@@ -89,9 +89,9 @@ EOF
 EOF
 }
 
-# Convert tpm_pcr.json into "kms:RecipientAttestation:NitroTPMPCR<n>": "<sha384>" pairs for
-# the key policy condition. <required-pcrs> is mandatory: accepting whatever happens to be
-# in the file made a weaker gate indistinguishable from success.
+# Convert tpm_pcr.json to "kms:RecipientAttestation:NitroTPMPCR<n>": "<sha384>" pairs.
+# required-pcrs is mandatory: accepting whatever's in the file made a weak gate
+# indistinguishable from success.
 # Args: <measurements-file> <required-pcrs, space-separated e.g. "PCR4 PCR7">.
 extract_pcr_values() {
   local measurements_file="$1" required_pcrs="${2:-}"
@@ -128,7 +128,8 @@ extract_pcr_values() {
     fi
   done
 
-  # Inline `if ! pcr_output=$(...)` because `set -e` is active: a bare assignment suppresses errexit.
+  # Inline `if ! pcr_output=$(...)` because `set -e` is active: a bare assignment suppresses
+  # errexit.
   local pcr_output
   if ! pcr_output=$(jq -r '
     .Measurements
@@ -159,11 +160,8 @@ extract_pcr_values() {
   return 0
 }
 
-# Emit the final, PCR-gated key policy on stdout. Admin keeps ScheduleKeyDeletion (clean.sh),
-# grant audit and GetKeyPolicy (the read-back below); Encrypt and PutKeyPolicy are gone for
-# good and Decrypt requires the attestation condition.
-# Built with jq -n so a malformed PCR condition fails here rather than installing a policy
-# whose condition does not parse the way it reads.
+# Emit final PCR-gated policy. Encrypt + PutKeyPolicy removed forever; Decrypt requires attestation.
+# jq -n so a malformed PCR condition fails here rather than silently installing a broken policy.
 # Args: <admin-principal> <instance-role-arn> <pcr-condition-object>.
 build_final_policy() {
   local admin="$1" instance_role="$2" pcr_condition="$3"
@@ -190,13 +188,12 @@ build_final_policy() {
     ]}'
 }
 
-# Assert the security properties of the key policy actually in force after put-key-policy.
-# Diffing the document against the one just sent does not work: KMS re-serializes what it
-# stores (whitespace, and a bare "Principal": "*" returns as {"AWS": "*"}), so normalization
-# is indistinguishable from a racing PutKeyPolicy. Check the properties that make the policy
-# ours instead — only the instance role may Decrypt, only under exactly these PCRs,
-# CreateGrant is denied to everyone, and no Allow keeps the ratcheted actions.
-# Prints one line per fault; empty output means the policy in force is ours.
+# Check security properties of the live policy. Diffing the stored document doesn't work: KMS
+# re-serializes it (whitespace, "*" → {"AWS":"*"}), so normalization is indistinguishable from
+# a racing
+# PutKeyPolicy. Checks: only instance role may Decrypt under exactly these PCRs; CreateGrant
+# Denied to all;
+# no Allow on ratcheted actions. Prints one line per fault; empty = policy is ours.
 # Args: <policy-json> <instance-role-arn> <pcr-condition-object>.
 kms_policy_faults() {
   local policy="$1" instance_role="$2" pcr_condition="$3"
@@ -209,8 +206,7 @@ kms_policy_faults() {
                       else (.Principal.AWS // empty) | as_list | .[] end ];
 
     [ .Statement[] | select(.Effect == "Allow") ] as $allow
-    # NotAction, or a Decrypt buried in kms:*, both land here or nowhere — either way the
-    # count check below fails closed rather than passing an unrecognised shape.
+    # NotAction or kms:* still land here; count check below fails closed on unrecognised shapes.
     | [ $allow[] | select(actions | any(. == "kms:decrypt" or . == "kms:*")) ] as $decrypt
     | [ .Statement[] | select(.Effect == "Deny")
         | select(actions | any(. == "kms:creategrant" or . == "kms:*")) ] as $deny
@@ -233,7 +229,8 @@ kms_policy_faults() {
       ] | .[]'
 }
 
-# Retry only IAM-propagation "invalid principals" errors (newly-created role not yet visible to KMS); all others fail immediately. Args: <what-for-messages> <aws-kms-args...>.
+# Retry only IAM-propagation "invalid principals" errors (newly-created role not yet visible to
+# KMS); all others fail immediately. Args: <what-for-messages> <aws-kms-args...>.
 kms_call_with_retry() {
   local what=$1
   shift

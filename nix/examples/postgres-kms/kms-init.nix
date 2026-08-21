@@ -26,8 +26,7 @@ pkgs.writeScript "kms-init.sh" ''
   kms_verify_pinned_key_id "$PINNED_KMS_KEY_ARN" "$KEY_ID" \
     || { echo "FATAL: refusing to decrypt against an unpinned or substituted KMS key" >&2; exit 1; }
 
-  # '-' is not in the base64 alphabet, so this is what stops unmeasured user-data from
-  # reaching the decrypt helper as a flag.
+  # '-' not in base64 alphabet; blocks unmeasured user-data from reaching the decrypt helper as a flag.
   case "$CIPHERTEXT" in
     "" | *[^A-Za-z0-9+/=]* )
       echo "FATAL: ciphertext is not base64; refusing to pass it to the decrypt helper" >&2

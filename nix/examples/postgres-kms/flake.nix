@@ -12,8 +12,7 @@
           pkgs = nixpkgs.legacyPackages."${system}";
           lib = nixpkgs.lib;
 
-          # Pinned at build time into the measured store closure: a different key requires a rebuild (changes PCR4, rejected by the policy).
-          # git-tracked on purpose — git+file:// flake refs only see tracked paths; empty = buildable but boots fail-closed.
+          # Pinned at build time: a key change requires a rebuild (new PCR4, rejected by policy); must be git-tracked.
           kmsKeyArn =
             if !builtins.pathExists ./kms-key-arn.txt then
               throw ("kms-key-arn.txt is missing from the flake source. It must be git-tracked: "
@@ -52,8 +51,7 @@
               extraGroups = [ "tpm" ];
             };
 
-            # Dedicated uid for the cert-decrypt parser; group kms-init lets it read
-            # /run/kms-init/{user_data.json,symmetric_key} without running as root.
+            # Dedicated uid for the cert-decrypt parser; kms-init group grants read of /run/kms-init without running as root.
             users.users.cert-init = {
               isSystemUser = true;
               group = "cert-init";
@@ -165,9 +163,7 @@
               requires = [ "kms-init.service" ];
               after = [ "kms-init.service" ];
               before = [ "postgresql.service" ];
-              # Parses operator-controlled bytes (base64|openssl|tar) with the disk key beside
-              # it — confine like kms-init so a parser RCE can't escalate or exfil. Ownership
-              # fixup that needs CAP_CHOWN is split into cert-init-perms.service.
+              # Parses operator-controlled bytes with the disk key beside it — confine like kms-init so a parser RCE can't escalate or exfil; CAP_CHOWN split into cert-init-perms.service.
               serviceConfig = {
                 Type = "oneshot";
                 ExecStart = certInitScript;
@@ -215,8 +211,7 @@
               };
             };
 
-            # Privileged ownership fixup, split out of the parsing unit: fixed paths only,
-            # no operator bytes, no decoder. Holds just the caps chown/chmod require.
+            # Privileged ownership fixup split from parsing unit: fixed paths only, no operator bytes, holds only chown/chmod caps.
             systemd.services.cert-init-perms = {
               description = "Set postgres ownership on decrypted PostgreSQL certs";
               wantedBy = [ "multi-user.target" ];
@@ -286,9 +281,7 @@
               dataDir = "/data/postgresql";
               # Defense in depth: per-page checksums catch torn/spliced pages that slip past dm-integrity.
               initdbArgs = [ "--data-checksums" ];
-              # Prod hardening: disable the bootstrap superuser so a postgres-uid
-              # RCE can't open a local superuser session. Debug overrides this
-              # (drops NOLOGIN) to keep operator `sudo -u postgres psql` access.
+              # Prod: NOLOGIN blocks a postgres-uid RCE from opening a local superuser session; debug drops it.
               initialScript = pkgs.writeText "init-postgres-client.sql" (basePgInitSql + ''
                 ALTER ROLE postgres NOLOGIN;
               '');
@@ -299,9 +292,7 @@
                 ssl_ca_file = "/run/postgresql-certs/ca.crt";
                 listen_addresses = lib.mkForce "*";
               };
-              # Only CN=postgres-client maps to a role (via the mtls map); the superuser is
-              # rejected over TCP. Closes the network-superuser path; the deployer still
-              # holds the CA key — see README Production Considerations.
+              # CN=postgres-client only; superuser rejected over TCP. Deployer holds the CA — see README.
               identMap = ''
                 mtls /^postgres-client$ postgres-client
               '';
@@ -389,9 +380,7 @@
 
             networking.firewall = {
               allowedTCPPorts = [ 5432 ];
-              # Only kms-init may reach IMDS; all other users are dropped.
-              # IPv6 IMDS (fd00:ec2::254) is off by default and nothing here uses
-              # it, so drop it outright for every uid (no ACCEPT carve-out needed).
+              # Only kms-init may reach IMDS; all other users dropped. IPv6 IMDS dropped outright (unused).
               extraCommands = "
                 ${pkgs.iptables}/bin/iptables -A OUTPUT -d 169.254.169.254 -m owner --uid-owner kms-init -j ACCEPT
                 ${pkgs.iptables}/bin/iptables -A OUTPUT -d 169.254.169.254 -j DROP
@@ -410,8 +399,7 @@
 
             services.amazon-ssm-agent.enable = true;
 
-            # Keep the bootstrap superuser LOGIN-able for `sudo -u postgres psql`
-            # inspection (prod hardens it to NOLOGIN via initialScript).
+            # Keep superuser LOGIN-able for operator psql (prod hardens to NOLOGIN).
             services.postgresql.initialScript =
               lib.mkForce (pkgs.writeText "init-postgres-client-debug.sql" basePgInitSql);
 

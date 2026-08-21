@@ -1,8 +1,6 @@
 #!/bin/bash
-# Phase two: replace the bootstrap policy with the PCR-gated final policy. Drops
-# PutKeyPolicy + Encrypt; admin keeps ScheduleKeyDeletion + ListGrants/RevokeGrant so
-# grants stay auditable. Fails closed if a grant was planted in the bootstrap window
-# (grants bypass the PCR condition and outlive the swap). Runs after 03 wrapped the DEK.
+# Phase two: installs the PCR-gated final policy, drops PutKeyPolicy+Encrypt, and fails
+# closed if a grant was planted in the bootstrap window (grants bypass PCR conditions).
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -24,8 +22,8 @@ usage() {
 KEY_ARN=""
 INSTANCE_ROLE=""
 ADMIN_ROLE=""
-# No defaults: the old MEASUREMENTS="result" silently produced a PCR4-only gate.
-# finalize-key.sh decides both and explains the PCR4/PCR7 split.
+# No default: the old MEASUREMENTS="result" silently produced a PCR4-only gate; finalize-key.sh
+# decides both.
 MEASUREMENTS=""
 REQUIRE_PCRS=""
 
@@ -67,8 +65,7 @@ if ! ADMIN_PRINCIPAL=$(normalize_admin_principal "$ADMIN_ROLE"); then
   exit 1
 fi
 
-# One canonical condition object for both the document and its read-back check: when the two
-# were built separately, the verification could disagree with what was installed.
+# One canonical condition for both install and verify: separate builds could disagree.
 PCR_CONDITION="{$PCR_VALUES}"
 
 if ! KEY_POLICY=$(build_final_policy "$ADMIN_PRINCIPAL" "$INSTANCE_ROLE" "$PCR_CONDITION"); then
@@ -114,8 +111,8 @@ if [ -n "$POLICY_FAULTS" ]; then
 fi
 echo "Installed policy verified: Decrypt is PCR-gated to the instance role; PutKeyPolicy, Encrypt and CreateGrant are gone."
 
-# Check grants AFTER finalize: a pre-check races the plant, whereas the final policy has
-# already denied CreateGrant. Polled because CreateGrant is eventually consistent.
+# Grant check after finalize: pre-check races the plant; final policy has already denied
+# CreateGrant. Polled for eventual consistency.
 echo "Verifying no grants were planted during the bootstrap window..."
 GRANTS=""
 for _ in 1 2 3 4 5 6; do

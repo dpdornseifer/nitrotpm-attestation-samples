@@ -1,13 +1,7 @@
 #!/bin/bash
 # Stage 2 of 6 — KEY CUSTODIAN.
-#
-# Creates the KMS key under a two-statement bootstrap policy: the Custodian gets
-# policy control, the Provisioner gets Encrypt. No single party can both rewrite the
-# policy (grant-plant) and mint ciphertext (DEK substitution).
-#
-# The key must exist before the build, because its ARN is pinned into the measured
-# image (PCR4) — see P484742014.md. Stage 3 owns writing that pin, so a key created
-# here is ORPHANED until build.sh tracks it.
+# Creates the KMS key: Custodian gets PutKeyPolicy, Provisioner gets Encrypt.
+# Key is orphaned until stage 3 pins its ARN into the image.
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"

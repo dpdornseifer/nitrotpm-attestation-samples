@@ -1,11 +1,7 @@
 #!/bin/bash
 #
-# AWS-free unit tests for the role-separation machinery: credential scoping,
-# the two-statement bootstrap policy, the signing-identity resource policy,
-# the five provisioning-role policies, and structural assertions that each
-# ceremony stage adopts exactly its own role.
-#
-# Pure bash + jq. No AWS calls, no network, no fixtures.
+# AWS-free unit tests for the role-separation machinery.
+# Pure bash + jq: no AWS calls, no network, no fixtures.
 
 set -u
 
@@ -35,9 +31,8 @@ assert_eq() {
 }
 
 # --- assume_role_exec: passthrough ------------------------------------------
-# An empty role ARN must run the command with ambient credentials and must not
-# emit anything of its own on stdout: eight call sites parse step-script stdout
-# with grep -oP, so one stray line breaks the parse silently.
+# Empty ARN uses ambient creds; stdout must be clean — callers parse it with grep -oP (see
+# lib/roles.sh).
 
 OUT=$(assume_role_exec "" -- printf 'hello')
 assert_eq "passthrough runs the command" "hello" "$OUT"
@@ -55,7 +50,6 @@ assert_eq "passthrough propagates a non-zero exit status" "1" "$?"
 assume_role_exec "" -- true
 assert_eq "passthrough propagates a zero exit status" "0" "$?"
 
-# The `--` separator is conventional but optional; both forms must work.
 OUT=$(assume_role_exec "" printf 'nodash')
 assert_eq "passthrough works without the -- separator" "nodash" "$OUT"
 
@@ -67,9 +61,6 @@ assert_eq "passthrough works without the -- separator" "nodash" "$OUT"
 CUSTODIAN="arn:aws:iam::123456789012:role/NitroTpmCustodianRole"
 PROVISIONER="arn:aws:iam::123456789012:role/NitroTpmProvisionerRole"
 
-# Zero-config equivalence: with no provisioner the document must stay exactly the
-# single-statement policy shipped before the split, so the default path is
-# provably unchanged.
 SINGLE=$(build_bootstrap_policy "$CUSTODIAN")
 assert_eq "single-identity policy has one statement" "1" \
   "$(printf '%s' "$SINGLE" | jq '.Statement | length')"
@@ -89,8 +80,7 @@ SAME=$(build_bootstrap_policy "$CUSTODIAN" "$CUSTODIAN")
 assert_eq "identical principals collapse to the single-statement policy" \
   "$(printf '%s' "$SINGLE" | jq -S .)" "$(printf '%s' "$SAME" | jq -S .)"
 
-# Split path: no single party may hold both PutKeyPolicy (grant-plant) and
-# Encrypt (DEK substitution).
+# Split path: no single party may hold both PutKeyPolicy and Encrypt.
 SPLIT=$(build_bootstrap_policy "$CUSTODIAN" "$PROVISIONER")
 assert_eq "split policy has two statements" "2" \
   "$(printf '%s' "$SPLIT" | jq '.Statement | length')"
@@ -109,8 +99,7 @@ assert_eq "provisioner statement does NOT hold PutKeyPolicy" "true" \
 assert_eq "split policy grants Decrypt to nobody" "true" \
   "$(printf '%s' "$SPLIT" | jq '[.Statement[].Action] | flatten | index("kms:Decrypt") == null')"
 
-# Source assertion: 02a must call the shared builder, not carry its own heredoc,
-# or the tested document and the shipped document can drift.
+# 02a must call the shared builder, or tested and shipped documents drift.
 if grep -q 'build_bootstrap_policy' "$SCRIPT_DIR/steps/02a_create_kms_key.sh"; then
   pass "source: 02a uses build_bootstrap_policy"
 else
@@ -123,9 +112,8 @@ else
 fi
 
 # --- kms_policy_faults ------------------------------------------------------
-# 02b reads the key policy back after put-key-policy. It must accept KMS's own
-# re-serialization of the document it was sent and reject any document that
-# actually widens access, since the finalize ratchet is irreversible.
+# 02b reads the policy back after put-key-policy: it must accept KMS's own
+# re-serialization but reject any widening, since the ratchet is irreversible.
 
 INSTANCE_ROLE_T="arn:aws:iam::123456789012:role/NitroTpmInstanceRole"
 PCR4_T="aa$(printf '4%.0s' {1..94})"
@@ -160,8 +148,7 @@ assert_policy_fault() {
   if [ -n "$faults" ]; then pass "$name"; else fail "$name -- expected a fault, got none"; fi
 }
 
-# The round trip that failed in production: the document 02b sends must satisfy the check
-# 02b runs on it, both verbatim and after KMS expands the bare Deny principal.
+# The round trip that failed in production: what 02b sends must pass its own check.
 SENT_T=$(build_final_policy "$CUSTODIAN" "$INSTANCE_ROLE_T" "$PCRS_T")
 assert_policy_ok "policy: the document build_final_policy sends passes its own check" "$SENT_T"
 assert_policy_ok "policy: the sent document still passes once KMS expands Principal \"*\"" \
@@ -231,22 +218,19 @@ fi
 DEPLOYER="arn:aws:iam::123456789012:role/NitroTpmDeployerRole"
 RP=$(build_identity_resource_policy "$DEPLOYER")
 
-# Deny, not Allow: Secrets Manager allows if either the identity or the resource
-# policy allows, so an Allow-only policy grants nothing exclusive.
+# Deny, not Allow: Secrets Manager allows if either policy allows.
 assert_eq "resource policy uses Deny" "Deny" \
   "$(printf '%s' "$RP" | jq -r '.Statement[0].Effect')"
 assert_eq "resource policy applies to every principal" "*" \
   "$(printf '%s' "$RP" | jq -r '.Statement[0].Principal')"
 
-# Scoped to GetSecretValue only: a blanket secretsmanager:* Deny would also block
-# DeleteSecret and break clean.sh teardown (clean.sh:58-61 deletes this secret).
+# GetSecretValue only: a blanket secretsmanager:* Deny would break clean.sh teardown.
 assert_eq "resource policy denies GetSecretValue only" "secretsmanager:GetSecretValue" \
   "$(printf '%s' "$RP" | jq -r '.Statement[0].Action')"
 assert_eq "resource policy does not use a wildcard action" "true" \
   "$(printf '%s' "$RP" | jq '[.Statement[].Action] | flatten | any(. == "secretsmanager:*") | not')"
 
-# ArnNotEquals per AWS guidance for ARN comparison; aws:PrincipalArn evaluates to
-# the IAM role ARN, never the assumed-role session ARN.
+# ArnNotEquals per AWS guidance; aws:PrincipalArn is the role ARN, not the session ARN.
 assert_eq "resource policy carves out the deployer with ArnNotEquals" "$DEPLOYER" \
   "$(printf '%s' "$RP" | jq -r '.Statement[0].Condition.ArnNotEquals["aws:PrincipalArn"]')"
 assert_eq "resource policy does not use StringNotEquals" "true" \
@@ -254,8 +238,7 @@ assert_eq "resource policy does not use StringNotEquals" "true" \
 assert_eq "resource policy carve-out is not a session ARN" "true" \
   "$(printf '%s' "$RP" | jq -r '.Statement[0].Condition.ArnNotEquals["aws:PrincipalArn"] | startswith("arn:aws:iam::")')"
 
-# Zero-config: no deployer means no meaningful lockdown, so warn on stderr and
-# succeed rather than failing the run or attaching a policy that denies everyone.
+# Zero-config: no deployer means no meaningful lockdown, so warn and succeed.
 WARN=$(lock_secret_to_deployer "arn:aws:secretsmanager:us-east-1:123456789012:secret:x" "" 2>&1 >/dev/null); RC=$?
 assert_eq "lock_secret_to_deployer succeeds with no deployer ARN" "0" "$RC"
 case "$WARN" in
@@ -271,15 +254,13 @@ esac
 ACCT="123456789012"
 OP=$(build_operator_policy "$ACCT" "TpmAttestationRole" "TpmAttestationProfile")
 CUST=$(build_custodian_policy)
-DEPL=$(build_deployer_policy)
+DEPL=$(build_deployer_policy "$ACCT")
 PROV=$(build_provisioner_policy)
 CLIENT=$(build_test_client_policy "$ACCT")
 
-# Helper: does any statement grant <action>?
 grants() {
   printf '%s' "$1" | jq --arg a "$2" '[.Statement[].Action] | flatten | index($a) != null'
 }
-# Helper: does any statement pair <action> with Resource "*"?
 grants_on_star() {
   printf '%s' "$1" | jq --arg a "$2" \
     '[.Statement[] | select(([.Action] | flatten | index($a)) != null)
@@ -287,18 +268,49 @@ grants_on_star() {
      | flatten | index("*") != null'
 }
 
-# The escalation guard: CreateRole/PassRole must never be unscoped.
+# "UNCONDITIONED" when a statement has no Condition; resource scoping alone doesn't bound which
+# policy.
+pinned_policy_arns() {
+  printf '%s' "$1" | jq -r --arg a "$2" \
+    '[.Statement[] | select(([.Action] | flatten | index($a)) != null)
+      | if .Condition == null then "UNCONDITIONED"
+        else (.Condition | to_entries[].value["iam:PolicyARN"] // "UNCONDITIONED") end]
+     | flatten | unique | join(",")'
+}
+
 assert_eq "operator iam:PassRole is resource-scoped" "false" "$(grants_on_star "$OP" "iam:PassRole")"
 assert_eq "operator iam:CreateRole is resource-scoped" "false" "$(grants_on_star "$OP" "iam:CreateRole")"
 assert_eq "operator iam:AttachRolePolicy is resource-scoped" "false" "$(grants_on_star "$OP" "iam:AttachRolePolicy")"
 assert_eq "operator iam:AddRoleToInstanceProfile is resource-scoped" "false" \
   "$(grants_on_star "$OP" "iam:AddRoleToInstanceProfile")"
 
+# Resource scoping is half of it: an unconditioned AttachRolePolicy can still put
+# AdministratorAccess on the pinned role, pass it to an instance and read IMDS.
+assert_eq "operator iam:AttachRolePolicy is pinned to the SSM managed policy" \
+  "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" \
+  "$(pinned_policy_arns "$OP" "iam:AttachRolePolicy")"
+assert_eq "operator iam:DetachRolePolicy is pinned to the SSM managed policy" \
+  "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" \
+  "$(pinned_policy_arns "$OP" "iam:DetachRolePolicy")"
+# iam:PutRolePolicy would sidestep the pin (inline, no policy ARN); asserted absent below.
+
+# Not pinned to the attested AMI: it is a stage-3 output and does not exist at stage 0.
+# Launching an unmeasured image gains nothing — the key policy gates Decrypt on PCR4+PCR7.
+assert_eq "operator holds ec2:RunInstances" "true" "$(grants "$OP" "ec2:RunInstances")"
+
 # Operator must be blind to the data.
 assert_eq "operator has no kms:Decrypt" "false" "$(grants "$OP" "kms:Decrypt")"
 assert_eq "operator has no kms:Encrypt" "false" "$(grants "$OP" "kms:Encrypt")"
 assert_eq "operator has no kms:PutKeyPolicy" "false" "$(grants "$OP" "kms:PutKeyPolicy")"
 assert_eq "operator cannot read any secret" "false" "$(grants "$OP" "secretsmanager:GetSecretValue")"
+# Teardown must not be a licence to delete the signing identity of another stack.
+assert_eq "operator secretsmanager:DeleteSecret is resource-scoped" "false" \
+  "$(grants_on_star "$OP" "secretsmanager:DeleteSecret")"
+assert_eq "operator DeleteSecret covers only the two families clean.sh owns" "true" \
+  "$(printf '%s' "$OP" | jq '[.Statement[]
+     | select(([.Action] | flatten | index("secretsmanager:DeleteSecret")) != null)
+     | .Resource] | flatten
+     | all(test("postgres-kms/client-cert-\\*$|nitrotpm-sb-identity-\\*$"))')"
 # clean.sh:85 deletes AMI backing snapshots; the documented monolith omitted this.
 assert_eq "operator can delete AMI snapshots" "true" "$(grants "$OP" "ec2:DeleteSnapshot")"
 
@@ -318,6 +330,16 @@ assert_eq "deployer holds secretsmanager:PutResourcePolicy" "true" \
   "$(grants "$DEPL" "secretsmanager:PutResourcePolicy")"
 assert_eq "deployer holds secretsmanager:GetResourcePolicy" "true" \
   "$(grants "$DEPL" "secretsmanager:GetResourcePolicy")"
+# The Deployer must not be able to read the client mTLS bundle.
+assert_eq "deployer secretsmanager:GetSecretValue is resource-scoped" "false" \
+  "$(grants_on_star "$DEPL" "secretsmanager:GetSecretValue")"
+assert_eq "deployer is scoped to the signing identity only" "true" \
+  "$(printf '%s' "$DEPL" | jq '[.Statement[]
+     | select(([.Action] | flatten | index("secretsmanager:GetSecretValue")) != null)
+     | .Resource] | flatten | all(contains("nitrotpm-sb-identity"))')"
+assert_eq "deployer cannot reach the client-cert bundle" "false" \
+  "$(printf '%s' "$DEPL" | jq '[.Statement[].Resource] | flatten
+     | any(contains("client-cert"))')"
 
 # Provisioner mints ciphertext, never rewrites policy.
 assert_eq "provisioner holds kms:Encrypt" "true" "$(grants "$PROV" "kms:Encrypt")"
@@ -337,7 +359,6 @@ for POLICY_NAME in OP CUST DEPL PROV CLIENT; do
   assert_eq "no iam:PutRolePolicy in $POLICY_NAME" "false" "$(grants "${!POLICY_NAME}" "iam:PutRolePolicy")"
 done
 
-# Every policy must be valid JSON with a Version and at least one statement.
 for POLICY_NAME in OP CUST DEPL PROV CLIENT; do
   assert_eq "$POLICY_NAME is well-formed" "2012-10-17" \
     "$(printf '%s' "${!POLICY_NAME}" | jq -r '.Version')"
@@ -352,24 +373,20 @@ else
   fail "source: 00_create_roles.sh must exist and be executable"
 fi
 
-# It must use the shared builders, not carry its own policy JSON, or the tested
-# documents and the shipped documents drift.
+# Must use the shared builders, or tested and shipped documents drift.
 if grep -q 'build_operator_policy' "$CREATE_ROLES" 2>/dev/null; then
   pass "source: 00_create_roles.sh uses the shared policy builders"
 else
   fail "source: 00_create_roles.sh must call build_operator_policy from lib/role-policies.sh"
 fi
-# This checks for inline PERMISSION policy documents only. The trust policy
-# (sts:AssumeRole) is a different IAM artifact with no shared builder; it is
-# legitimately constructed via jq -n in the script. Do not convert it back
-# to a heredoc — doing so would re-introduce the literal this check catches.
+# Inline PERMISSION documents only. The trust policy is a different artifact with no
+# shared builder, legitimately built via jq -n — do not convert it back to a heredoc.
 if grep -q '"Version": "2012-10-17"' "$CREATE_ROLES" 2>/dev/null; then
   fail "source: 00_create_roles.sh inlines a policy document instead of using the builders"
 else
   pass "source: 00_create_roles.sh inlines no policy documents"
 fi
 
-# Every ARN the orchestrator parses must actually be emitted on stdout.
 for EMIT in CUSTODIAN_ROLE_ARN PROVISIONER_ROLE_ARN DEPLOYER_ROLE_ARN OPERATOR_ROLE_ARN TEST_CLIENT_ROLE_ARN; do
   if grep -q "$EMIT:" "$CREATE_ROLES" 2>/dev/null; then
     pass "source: 00_create_roles.sh emits $EMIT"
@@ -396,8 +413,7 @@ fi
 # shellcheck source=lib/aws-creds.sh
 . "$SCRIPT_DIR/lib/aws-creds.sh"
 
-# Already-set variables must be left exactly as they are and must not invoke the
-# AWS CLI at all: stub `aws` to prove no fallback lookup happens.
+# Set variables must be left alone and must not call the CLI: stub `aws` to prove it.
 aws() { echo "STUB-CALLED"; }
 
 (
@@ -421,8 +437,7 @@ assert_eq "resolve_aws_credentials does not shell out when all vars are set" "0"
 )
 assert_eq "resolve_aws_credentials preserves an already-set region" "0" "$?"
 
-# A variable that is neither in the environment nor resolvable must fail loudly,
-# not silently proceed to an AWS call that errors cryptically later.
+# An unresolvable variable must fail loudly, not defer to a cryptic AWS error.
 (
   unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
   aws() { return 1; }
@@ -460,9 +475,8 @@ assert_eq "resolve_aws_credentials exports values from aws configure" "0" "$?"
 unset -f aws
 
 # --- stage scripts: each adopts exactly its own role ------------------------
-# A stage naming another role's flag means the ceremony's boundaries are wrong in
-# a way no runtime test would catch — the run would simply succeed with too much
-# privilege.
+# A stage naming another role's flag means the boundaries are wrong in a way no
+# runtime test catches — the run would just succeed with too much privilege.
 
 assert_stage_role() {
   local stage=$1 want_flag=$2 path="$SCRIPT_DIR/$1"
@@ -513,8 +527,8 @@ assert_stage_role() {
 assert_stage_role "prepare-role.sh" "--operator-role-arn"
 assert_stage_role "create-key.sh" "--custodian-role-arn"
 
-# create-key.sh is the one stage that names a second role: the bootstrap policy
-# must grant Encrypt to the Provisioner even though the Custodian installs it.
+# create-key.sh is the one stage naming a second role: the policy grants the
+# Provisioner Encrypt even though the Custodian installs it.
 if grep -q -- '--provisioner-role-arn' "$SCRIPT_DIR/create-key.sh"; then
   pass "create-key.sh accepts --provisioner-role-arn for the bootstrap policy"
 else
@@ -524,8 +538,7 @@ fi
 assert_stage_role "build.sh" "--deployer-role-arn"
 
 BUILD="$SCRIPT_DIR/build.sh"
-# The Deployer must both write and track the pin, and must fail closed: an untracked
-# file is invisible to the flake, which would silently build an unpinned image.
+# The Deployer must write and track the pin: an untracked file is invisible to the flake.
 if grep -q 'git -C "\$PROJECT_DIR" add' "$BUILD" 2>/dev/null; then
   pass "build.sh git-adds the pinned ARN file"
 else
@@ -537,7 +550,6 @@ else
   fail "build.sh must verify the pin is tracked and fail closed"
 fi
 
-# 02a must no longer touch the ARN file: the CLI value is the single source of truth.
 A2="$SCRIPT_DIR/steps/02a_create_kms_key.sh"
 if grep -q 'kms-key-arn.txt' "$A2"; then
   fail "02a must no longer write or reference kms-key-arn.txt (build.sh owns the pin)"
@@ -553,9 +565,8 @@ fi
 assert_stage_role "provision-secrets.sh" "--provisioner-role-arn"
 
 PROV_STAGE="$SCRIPT_DIR/provision-secrets.sh"
-# The plaintext DEK must not survive an abort. An explicit rm on the happy path is
-# not enough: a set -e abort or a signal between mktemp and that rm leaves the key
-# on disk (the e2e-test.sh:339-356 defect this stage replaces).
+# The plaintext DEK must not survive an abort: an rm on the happy path leaves the key
+# on disk if a signal lands between mktemp and rm.
 if grep -qE "trap .*(EXIT|INT|TERM)" "$PROV_STAGE" 2>/dev/null; then
   pass "provision-secrets.sh traps EXIT to destroy the plaintext DEK"
 else
@@ -579,8 +590,7 @@ assert_stage_role "finalize-key.sh" "--custodian-role-arn"
 assert_stage_role "deploy.sh" "--operator-role-arn"
 
 FIN="$SCRIPT_DIR/finalize-key.sh"
-# Finalize must require the PCRs: silently finalizing without them would install a
-# policy gated on nothing, which is strictly weaker and would look like success.
+# Finalize must require the PCRs, or it installs a policy gated on nothing.
 for REQ in --instance-role-arn --pcr-dir; do
   if grep -q -- "$REQ" "$FIN" 2>/dev/null; then
     pass "finalize-key.sh accepts $REQ"
@@ -595,8 +605,7 @@ else
 fi
 
 DEP="$SCRIPT_DIR/deploy.sh"
-# Ported from the former postgres-kms start.sh (deleted in the six-stage refactor) —
-# without these the operator has no idea how to reach the database they just launched.
+# Ported from the deleted start.sh — without these the operator cannot reach the DB.
 if grep -q 'print_sg_authorization_notice' "$DEP" 2>/dev/null; then
   pass "deploy.sh prints the SG authorization notice"
 else
@@ -636,9 +645,8 @@ for STEP in 02a_create_kms_key.sh 00_create_ami.sh 01_create_instance_profile.sh
   fi
 done
 
-# 05_run_instance.sh is the documented exception: phase 3's relaunch goes through
-# run_instance_step, because calling deploy.sh would create a second EBS volume and
-# defeat the persistence test.
+# 05_run_instance.sh is the documented exception: deploy.sh would create a second
+# EBS volume and defeat the persistence test.
 if grep -q 'run_instance_step' "$E2E"; then
   pass "e2e-test.sh reuses run_instance_step for the phase 3 relaunch"
 else
@@ -654,13 +662,20 @@ for FLAG in --custodian-role-arn --provisioner-role-arn --deployer-role-arn \
   fi
 done
 
-# The Custodian ARN must be persisted, or clean.sh cannot schedule key deletion
-# under the right role after a --no-cleanup resume.
+# The Custodian ARN must be persisted, or clean.sh cannot delete the key after resume.
 if grep -q 'update_resource "CUSTODIAN_ROLE_ARN"' "$E2E"; then
   pass "e2e-test.sh persists the custodian ARN for clean.sh"
 else
   fail "e2e-test.sh must persist CUSTODIAN_ROLE_ARN into resources.json"
 fi
+
+# --- every AWS-touching nix app in stage 3 runs under the Deployer role ------
+# Per-call adoption prevents silently forgetting the wrapper on new nix calls (see
+# 00_create_ami.sh).
+AMI_STEP="$SCRIPT_DIR/steps/00_create_ami.sh"
+assert_eq "every AWS nix app in 00_create_ami.sh runs under the Deployer role" \
+  "$(grep -c 'run \.#create-ami\|run \.#sign-efi-image' "$AMI_STEP")" \
+  "$(grep -c 'assume_role_exec "\$ROLE_ARN" --' "$AMI_STEP")"
 
 # --- start.sh is gone and nothing points at it ------------------------------
 if [ -e "$SCRIPT_DIR/start.sh" ]; then
@@ -679,7 +694,6 @@ for F in "$SCRIPT_DIR/steps/00_create_ami.sh" "$SCRIPT_DIR/lib/identity.sh" \
   fi
 done
 
-# Every ported capability must have landed somewhere before start.sh is removed.
 if grep -q 'resolve_aws_credentials' "$SCRIPT_DIR/lib/aws-creds.sh" 2>/dev/null; then
   pass "ported: credential fallback lives in lib/aws-creds.sh"
 else

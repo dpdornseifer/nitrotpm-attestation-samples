@@ -22,13 +22,11 @@ if [ -z "$ROLE_NAME" ] || [ -z "$INSTANCE_PROFILE_NAME" ]; then
   usage
 fi
 
-# Check if the instance profile already exists
 if aws iam get-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME" &> /dev/null; then
   echo "Instance profile $INSTANCE_PROFILE_NAME already exists. Exiting successfully."
   exit 0
 fi
 
-# Create the role if it doesn't exist
 if ! aws iam get-role --role-name "$ROLE_NAME" &> /dev/null; then
   aws iam create-role \
     --role-name "$ROLE_NAME" \
@@ -49,13 +47,11 @@ else
   echo "Role $ROLE_NAME already exists."
 fi
 
-# Create the instance profile and add the role
 aws iam create-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME"
 aws iam add-role-to-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME" --role-name "$ROLE_NAME"
 
 echo "$ROLE_NAME role and $INSTANCE_PROFILE_NAME instance profile have been created successfully."
 
-# In debug mode, attach the SSM managed policy for Systems Manager access
 if [ "$DEBUG" = true ]; then
   echo "Debug mode: attaching AmazonSSMManagedInstanceCore policy for SSM access..."
   aws iam attach-role-policy \
