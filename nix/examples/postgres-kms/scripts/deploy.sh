@@ -32,7 +32,7 @@ usage() {
 AMI_ID=""
 INSTANCE_PROFILE_NAME=""
 OPERATOR_ROLE_ARN=""
-VPC_ID_FLAG=""
+VPC_ID=""
 DEBUG_FLAG=""
 AUTHORIZE_MY_IP=false
 
@@ -41,7 +41,7 @@ while [[ "$#" -gt 0 ]]; do
     --ami-id) AMI_ID="${2:?--ami-id requires a value}"; shift ;;
     --instance-profile) INSTANCE_PROFILE_NAME="${2:?--instance-profile requires a value}"; shift ;;
     --operator-role-arn) OPERATOR_ROLE_ARN="${2:?--operator-role-arn requires a value}"; shift ;;
-    --vpc-id) VPC_ID_FLAG="--vpc-id ${2:?--vpc-id requires a value}"; shift ;;
+    --vpc-id) VPC_ID="${2:?--vpc-id requires a value}"; shift ;;
     --debug) DEBUG_FLAG="--debug" ;;
     --authorize-my-ip) AUTHORIZE_MY_IP=true ;;
     *) usage ;;
@@ -59,9 +59,26 @@ fi
 
 resolve_aws_credentials || exit 1
 
+# clean.sh tears down only what it finds here. The manual ceremony has no orchestrator to parse
+# this script's stdout, so record every resource as soon as it exists.
+RESOURCES_FILE="$PROJECT_DIR/artifacts/resources.json"
+[ -f "$RESOURCES_FILE" ] || echo '{}' > "$RESOURCES_FILE"
+
 echo "Stage 6/6 (Operator): creating the encrypted data volume..." >&2
+# Take the AZ from a subnet in the target VPC, not the region's first AZ. 05_run_instance.sh looks
+# the subnet up by the volume's AZ, so a VPC with no subnet there fails only after the volume exists.
+if [ -n "$VPC_ID" ]; then
+  SUBNET_FILTER=(--filters "Name=vpc-id,Values=$VPC_ID")
+else
+  SUBNET_FILTER=(--filters "Name=default-for-az,Values=true")
+fi
 AVAILABILITY_ZONE=$(assume_role_exec "$OPERATOR_ROLE_ARN" -- \
-  aws ec2 describe-availability-zones --query 'AvailabilityZones[0].ZoneName' --output text)
+  aws ec2 describe-subnets "${SUBNET_FILTER[@]}" \
+    --query 'Subnets[0].AvailabilityZone' --output text)
+if [ -z "$AVAILABILITY_ZONE" ] || [ "$AVAILABILITY_ZONE" = "None" ]; then
+  echo "Error: no subnet found in ${VPC_ID:-the default VPC}; cannot place the data volume." >&2
+  exit 1
+fi
 
 if ! VOLUME_OUTPUT=$(assume_role_exec "$OPERATOR_ROLE_ARN" -- \
       "$SCRIPT_DIR/steps/04_create_ebs_volume.sh" -z "$AVAILABILITY_ZONE"); then
@@ -70,14 +87,18 @@ if ! VOLUME_OUTPUT=$(assume_role_exec "$OPERATOR_ROLE_ARN" -- \
   exit 1
 fi
 
-VOLUME_ID=$(printf '%s' "$VOLUME_OUTPUT" | grep -oP 'Volume ID: \K.*' | head -n1)
+VOLUME_ID=$(printf '%s' "$VOLUME_OUTPUT" | sed -n 's/.*Volume ID: //p' | head -n1)
 if [ -z "$VOLUME_ID" ]; then
   echo "Error: could not extract the volume ID." >&2
   echo "$VOLUME_OUTPUT" >&2
   exit 1
 fi
+# Before the launch: a failed launch would otherwise leave this volume untracked.
+update_resource "VOLUME_ID" "$VOLUME_ID" || exit 1
 
 echo "Stage 6/6 (Operator): launching the instance..." >&2
+VPC_ID_FLAG=""
+[ -n "$VPC_ID" ] && VPC_ID_FLAG="--vpc-id $VPC_ID"
 # bash -c: assume_role_exec takes a command, not a function; exporting creds to the current
 # shell would leave wrong ones active on failure.
 if ! INSTANCE_OUTPUT=$(assume_role_exec "$OPERATOR_ROLE_ARN" -- \
@@ -87,16 +108,18 @@ if ! INSTANCE_OUTPUT=$(assume_role_exec "$OPERATOR_ROLE_ARN" -- \
   exit 1
 fi
 
-INSTANCE_ID=$(printf '%s' "$INSTANCE_OUTPUT" | grep -oP 'Instance ID: \K.*' | head -n1)
-PRIVATE_IP=$(printf '%s' "$INSTANCE_OUTPUT" | grep -oP 'Private IP: \K.*' | head -n1)
-PUBLIC_IP=$(printf '%s' "$INSTANCE_OUTPUT" | grep -oP 'Public IP: \K.*' | head -n1)
-SG_ID=$(printf '%s' "$INSTANCE_OUTPUT" | grep -oP 'Security Group ID: \K.*' | head -n1)
+INSTANCE_ID=$(printf '%s' "$INSTANCE_OUTPUT" | sed -n 's/.*Instance ID: //p' | head -n1)
+PRIVATE_IP=$(printf '%s' "$INSTANCE_OUTPUT" | sed -n 's/.*Private IP: //p' | head -n1)
+PUBLIC_IP=$(printf '%s' "$INSTANCE_OUTPUT" | sed -n 's/.*Public IP: //p' | head -n1)
+SG_ID=$(printf '%s' "$INSTANCE_OUTPUT" | sed -n 's/.*Security Group ID: //p' | head -n1)
 
 if [ -z "$INSTANCE_ID" ] || [ -z "$PUBLIC_IP" ] || [ -z "$SG_ID" ]; then
   echo "Error: could not extract the instance details." >&2
   echo "$INSTANCE_OUTPUT" >&2
   exit 1
 fi
+update_resource "INSTANCE_ID" "$INSTANCE_ID" || exit 1
+update_resource "SECURITY_GROUP_ID" "$SG_ID" || exit 1
 
 echo "VOLUME_ID: $VOLUME_ID"
 echo "INSTANCE_ID: $INSTANCE_ID"

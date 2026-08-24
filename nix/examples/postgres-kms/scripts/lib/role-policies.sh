@@ -221,8 +221,14 @@ build_deployer_policy() {
 EOF
 }
 
+# CreateSecret is scoped to postgres-kms/client-cert-* so this role cannot create secrets in
+# another namespace — notably not one that shadows the signing identity.
+# kms:Encrypt stays on "*" for the same reason ec2:RunInstances is unpinned: the key is a stage-2
+# output and does not exist when these roles are created in stage 0. The bootstrap key policy is
+# what actually admits this role to the ceremony key. Args: <account_id>.
 build_provisioner_policy() {
-  cat <<'EOF'
+  local acct="$1"
+  cat <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -240,7 +246,7 @@ build_provisioner_policy() {
       "Action": [
         "secretsmanager:CreateSecret"
       ],
-      "Resource": "*"
+      "Resource": "arn:aws:secretsmanager:*:${acct}:secret:postgres-kms/client-cert-*"
     },
     {
       "Sid": "STSIdentity",

@@ -16,8 +16,10 @@ validate_secret_arn() {
 
 # Print the command to allowlist the caller's host on 5432. Never edits the SG. Args: <sg_id>.
 print_sg_authorization_notice() {
-  local sg_id="$1" my_ip
+  local sg_id="$1" my_ip region
   my_ip=$(curl -s --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]')
+  # e2e-test.sh doesn't source aws-creds.sh, so AWS_DEFAULT_REGION can be unset here.
+  region="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || true)}}"
   echo ""
   echo "=== ACTION REQUIRED: authorize your host on the DB security group ==="
   echo "Security Group: ${sg_id:-<unknown>}"
@@ -27,12 +29,12 @@ print_sg_authorization_notice() {
   echo ""
   if [ -n "$my_ip" ]; then
     echo "  Your public IP: $my_ip  (from https://checkip.amazonaws.com)"
-    echo "  aws ec2 authorize-security-group-ingress \\"
+    echo "  aws ec2 authorize-security-group-ingress --region ${region:-<REGION>} \\"
     echo "    --group-id ${sg_id:-<SG_ID>} --protocol tcp --port 5432 \\"
     echo "    --cidr ${my_ip}/32"
   else
     echo "  (could not auto-detect your public IP via checkip.amazonaws.com)"
-    echo "  aws ec2 authorize-security-group-ingress \\"
+    echo "  aws ec2 authorize-security-group-ingress --region ${region:-<REGION>} \\"
     echo "    --group-id ${sg_id:-<SG_ID>} --protocol tcp --port 5432 \\"
     echo "    --cidr <YOUR_PUBLIC_IP>/32"
   fi
@@ -69,8 +71,14 @@ update_resource() {
   local VALUE=$2
   local tmp
   tmp=$(mktemp "${RESOURCES_FILE}.XXXXXX")
-  # shellcheck disable=SC2015  # A&&B||C is intentional: rm tmp only on failure
-  jq --arg key "$KEY" --arg value "$VALUE" '.[$key] = $value' "$RESOURCES_FILE" > "$tmp" && mv "$tmp" "$RESOURCES_FILE" || rm -f "$tmp"
+  # Must return non-zero on a failed write: a silent skip here means clean.sh never learns
+  # about the resource and it is orphaned.
+  if ! jq --arg key "$KEY" --arg value "$VALUE" '.[$key] = $value' "$RESOURCES_FILE" > "$tmp" \
+       || ! mv "$tmp" "$RESOURCES_FILE"; then
+    rm -f "$tmp"
+    echo "Error: could not record $KEY in $RESOURCES_FILE." >&2
+    return 1
+  fi
 }
 
 # Returns signed-image/ (PCR4+PCR7) when secure boot active, else result/ (PCR4). Args:
@@ -227,7 +235,14 @@ upload_secret() {
     --secret-string "file://$src" \
     --query 'ARN' --output text) || return 1
 
-  lock_secret_to_deployer "$arn" "$deployer" || return 1
+  # Destroy the secret if locking fails. It already holds the private signing key, the ARN was
+  # never printed, and clean.sh only deletes recorded ARNs — so leaving it orphans a live key.
+  if ! lock_secret_to_deployer "$arn" "$deployer"; then
+    aws secretsmanager delete-secret --secret-id "$arn" \
+      --force-delete-without-recovery >/dev/null 2>&1 \
+      || echo "Error: could not delete unlocked secret $arn; delete it manually." >&2
+    return 1
+  fi
   printf '%s\n' "$arn"
 }
 

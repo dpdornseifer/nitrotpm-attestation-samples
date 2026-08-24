@@ -21,7 +21,9 @@ pkgs.writeScript "kms-init.sh" ''
 
   # Default to "" so an absent key_id reaches kms_verify_pinned_key_id with a clear error, not a bare jq failure.
   KEY_ID=$(echo "$USER_DATA" | ${pkgs.jq}/bin/jq -r '.key_id // ""')
-  CIPHERTEXT=$(echo "$USER_DATA" | ${pkgs.jq}/bin/jq -re .ciphertext)
+  # Default to "" for the same reason as key_id: -re would abort here under `set -e`, before the
+  # base64 guard below could report why.
+  CIPHERTEXT=$(echo "$USER_DATA" | ${pkgs.jq}/bin/jq -r '.ciphertext // ""')
 
   kms_verify_pinned_key_id "$PINNED_KMS_KEY_ARN" "$KEY_ID" \
     || { echo "FATAL: refusing to decrypt against an unpinned or substituted KMS key" >&2; exit 1; }

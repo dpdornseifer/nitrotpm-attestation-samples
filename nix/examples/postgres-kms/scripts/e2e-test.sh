@@ -267,7 +267,10 @@ cleanup() {
 
   if [ -n "$SECRET_ARN" ]; then
     echo "Deleting Secrets Manager secret: $SECRET_ARN"
-    if ! aws secretsmanager delete-secret --secret-id "$SECRET_ARN" --force-delete-without-recovery 2>&1; then
+    # Under the Operator role, not ambient credentials: ambient would succeed even if the
+    # Operator's DeleteSecret scope no longer covered this secret, hiding the regression.
+    if ! assume_role_exec "$OPERATOR_ROLE_ARN" -- \
+        aws secretsmanager delete-secret --secret-id "$SECRET_ARN" --force-delete-without-recovery 2>&1; then
       echo "Warning: Failed to delete Secrets Manager secret (non-critical)"
     fi
   fi
@@ -285,6 +288,7 @@ cleanup() {
   if [ -f "$RESOURCES_FILE" ]; then
     CLEAN_ARGS=()
     [ -n "$CUSTODIAN_ROLE_ARN" ] && CLEAN_ARGS+=(--custodian-role-arn "$CUSTODIAN_ROLE_ARN")
+    [ -n "$OPERATOR_ROLE_ARN" ] && CLEAN_ARGS+=(--operator-role-arn "$OPERATOR_ROLE_ARN")
     [ "$CREATE_ROLES" = true ] && CLEAN_ARGS+=(--delete-provisioning-roles)
     "$SCRIPT_DIR/clean.sh" "${CLEAN_ARGS[@]+"${CLEAN_ARGS[@]}"}" \
       && PHASE4_RESULT="PASS" || PHASE4_RESULT="FAIL"
@@ -306,11 +310,11 @@ phase1() {
   if [ "$CREATE_ROLES" = true ]; then
     echo "Stage 0: Creating the five provisioning roles..."
     OUTPUT=$("$SCRIPT_DIR/steps/00_create_roles.sh") || { echo "Role creation failed"; return 1; }
-    CUSTODIAN_ROLE_ARN=$(echo "$OUTPUT" | grep -oP 'CUSTODIAN_ROLE_ARN: \K.*')
-    PROVISIONER_ROLE_ARN=$(echo "$OUTPUT" | grep -oP 'PROVISIONER_ROLE_ARN: \K.*')
-    DEPLOYER_ROLE_ARN=$(echo "$OUTPUT" | grep -oP 'DEPLOYER_ROLE_ARN: \K.*')
-    OPERATOR_ROLE_ARN=$(echo "$OUTPUT" | grep -oP 'OPERATOR_ROLE_ARN: \K.*')
-    TEST_CLIENT_ROLE_ARN=$(echo "$OUTPUT" | grep -oP 'TEST_CLIENT_ROLE_ARN: \K.*')
+    CUSTODIAN_ROLE_ARN=$(echo "$OUTPUT" | sed -n 's/.*CUSTODIAN_ROLE_ARN: //p')
+    PROVISIONER_ROLE_ARN=$(echo "$OUTPUT" | sed -n 's/.*PROVISIONER_ROLE_ARN: //p')
+    DEPLOYER_ROLE_ARN=$(echo "$OUTPUT" | sed -n 's/.*DEPLOYER_ROLE_ARN: //p')
+    OPERATOR_ROLE_ARN=$(echo "$OUTPUT" | sed -n 's/.*OPERATOR_ROLE_ARN: //p')
+    TEST_CLIENT_ROLE_ARN=$(echo "$OUTPUT" | sed -n 's/.*TEST_CLIENT_ROLE_ARN: //p')
     for VAR in CUSTODIAN_ROLE_ARN PROVISIONER_ROLE_ARN DEPLOYER_ROLE_ARN OPERATOR_ROLE_ARN TEST_CLIENT_ROLE_ARN; do
       [ -n "${!VAR}" ] || { echo "Failed to extract $VAR"; return 1; }
     done
@@ -335,7 +339,7 @@ phase1() {
     ${OPERATOR_ROLE_ARN:+--operator-role-arn "$OPERATOR_ROLE_ARN"} \
     -r "$ROLE_NAME" -p "$INSTANCE_PROFILE_NAME" $DEBUG_FLAG) \
     || { echo "Stage 1 failed"; return 1; }
-  INSTANCE_ROLE_ARN=$(echo "$OUTPUT" | grep -oP 'INSTANCE_ROLE_ARN: \K.*')
+  INSTANCE_ROLE_ARN=$(echo "$OUTPUT" | sed -n 's/.*INSTANCE_ROLE_ARN: //p')
   [ -z "$INSTANCE_ROLE_ARN" ] && { echo "Failed to extract INSTANCE_ROLE_ARN"; return 1; }
   update_resource "ROLE_NAME" "$ROLE_NAME"
   update_resource "INSTANCE_PROFILE_NAME" "$INSTANCE_PROFILE_NAME"
@@ -347,7 +351,7 @@ phase1() {
     ${CUSTODIAN_ROLE_ARN:+--custodian-role-arn "$CUSTODIAN_ROLE_ARN"} \
     ${PROVISIONER_ROLE_ARN:+--provisioner-role-arn "$PROVISIONER_ROLE_ARN"}) \
     || { echo "Stage 2 failed"; return 1; }
-  KMS_KEY_ARN=$(echo "$OUTPUT" | grep -oP 'KMS key created with ARN: \K.*')
+  KMS_KEY_ARN=$(echo "$OUTPUT" | sed -n 's/.*KMS key created with ARN: //p')
   [ -z "$KMS_KEY_ARN" ] && { echo "Failed to extract KMS key ARN"; return 1; }
   update_resource "KMS_KEY_ARN" "$KMS_KEY_ARN"
   echo "KMS Key ARN: $KMS_KEY_ARN"
@@ -365,9 +369,9 @@ phase1() {
     fi
   fi
   OUTPUT=$("$SCRIPT_DIR/build.sh" "${BUILD_ARGS[@]}") || { echo "Stage 3 failed"; return 1; }
-  AMI_ID=$(echo "$OUTPUT" | grep -oP 'AMI_ID: \K.*')
-  PCR_DIR=$(echo "$OUTPUT" | grep -oP 'PCR_DIR: \K.*')
-  IDENTITY_ARN=$(echo "$OUTPUT" | grep -oP 'IDENTITY_ARN: \K.*' || true)
+  AMI_ID=$(echo "$OUTPUT" | sed -n 's/.*AMI_ID: //p')
+  PCR_DIR=$(echo "$OUTPUT" | sed -n 's/.*PCR_DIR: //p')
+  IDENTITY_ARN=$(echo "$OUTPUT" | sed -n 's/.*IDENTITY_ARN: //p' || true)
   [ -z "$AMI_ID" ] && { echo "Failed to extract AMI ID"; return 1; }
   [ -z "$PCR_DIR" ] && { echo "Failed to extract PCR_DIR"; return 1; }
   update_resource "AMI_ID" "$AMI_ID"
@@ -379,7 +383,7 @@ phase1() {
   OUTPUT=$("$SCRIPT_DIR/provision-secrets.sh" --key-id "$KMS_KEY_ARN" \
     ${PROVISIONER_ROLE_ARN:+--provisioner-role-arn "$PROVISIONER_ROLE_ARN"}) \
     || { echo "Stage 4 failed"; return 1; }
-  SECRET_ARN=$(echo "$OUTPUT" | grep -oP 'SECRET_ARN: \K.*')
+  SECRET_ARN=$(echo "$OUTPUT" | sed -n 's/.*SECRET_ARN: //p')
   [ -z "$SECRET_ARN" ] && { echo "Failed to extract SECRET_ARN"; return 1; }
   update_resource "SECRET_ARN" "$SECRET_ARN"
 
@@ -401,11 +405,11 @@ phase1() {
   [ -n "$DEBUG_FLAG" ] && DEPLOY_ARGS+=("$DEBUG_FLAG")
   [ "$AUTHORIZE_MY_IP" = true ] && DEPLOY_ARGS+=(--authorize-my-ip)
   OUTPUT=$("$SCRIPT_DIR/deploy.sh" "${DEPLOY_ARGS[@]}") || { echo "Stage 6 failed"; return 1; }
-  VOLUME_ID=$(echo "$OUTPUT" | grep -oP 'VOLUME_ID: \K.*')
-  INSTANCE_ID=$(echo "$OUTPUT" | grep -oP 'INSTANCE_ID: \K.*')
-  PRIVATE_IP=$(echo "$OUTPUT" | grep -oP 'PRIVATE_IP: \K.*')
-  PUBLIC_IP=$(echo "$OUTPUT" | grep -oP 'PUBLIC_IP: \K.*')
-  SG_ID=$(echo "$OUTPUT" | grep -oP 'SECURITY_GROUP_ID: \K.*')
+  VOLUME_ID=$(echo "$OUTPUT" | sed -n 's/.*VOLUME_ID: //p')
+  INSTANCE_ID=$(echo "$OUTPUT" | sed -n 's/.*INSTANCE_ID: //p')
+  PRIVATE_IP=$(echo "$OUTPUT" | sed -n 's/.*PRIVATE_IP: //p')
+  PUBLIC_IP=$(echo "$OUTPUT" | sed -n 's/.*PUBLIC_IP: //p')
+  SG_ID=$(echo "$OUTPUT" | sed -n 's/.*SECURITY_GROUP_ID: //p')
   { [ -z "$INSTANCE_ID" ] || [ -z "$PUBLIC_IP" ] || [ -z "$SG_ID" ] || [ -z "$VOLUME_ID" ]; } \
     && { echo "Failed to extract instance details"; return 1; }
   update_resource "VOLUME_ID" "$VOLUME_ID"
@@ -529,10 +533,10 @@ phase3() {
   echo "Launching second instance..."
   OUTPUT=$(assume_role_exec "$OPERATOR_ROLE_ARN" -- \
     run_instance_step "$AMI_ID" "$INSTANCE_PROFILE_NAME" "$VOLUME_ID" "$VPC_ID_FLAG" "$DEBUG_FLAG")
-  INSTANCE_ID=$(echo "$OUTPUT" | grep -oP 'Instance ID: \K.*')
-  PRIVATE_IP=$(echo "$OUTPUT" | grep -oP 'Private IP: \K.*')
-  PUBLIC_IP=$(echo "$OUTPUT" | grep -oP 'Public IP: \K.*')
-  SG_ID2=$(echo "$OUTPUT" | grep -oP 'Security Group ID: \K.*')
+  INSTANCE_ID=$(echo "$OUTPUT" | sed -n 's/.*Instance ID: //p')
+  PRIVATE_IP=$(echo "$OUTPUT" | sed -n 's/.*Private IP: //p')
+  PUBLIC_IP=$(echo "$OUTPUT" | sed -n 's/.*Public IP: //p')
+  SG_ID2=$(echo "$OUTPUT" | sed -n 's/.*Security Group ID: //p')
   [ -z "$INSTANCE_ID" ] || [ -z "$PUBLIC_IP" ] && { echo "Failed to launch second instance"; return 1; }
   update_resource "INSTANCE_ID" "$INSTANCE_ID"
   [ -n "$SG_ID2" ] && update_resource "SECURITY_GROUP_ID" "$SG_ID2"

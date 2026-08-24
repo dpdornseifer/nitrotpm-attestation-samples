@@ -66,7 +66,7 @@ fi
 # Destroy the plaintext eagerly; the trap remains as the abort-path guarantee.
 rm -f "$KEY_FILE"
 
-SECRET_ARN=$(printf '%s' "$CERT_OUTPUT" | grep -oP 'SECRET_ARN: \K.*' | head -n1)
+SECRET_ARN=$(printf '%s' "$CERT_OUTPUT" | sed -n 's/.*SECRET_ARN: //p' | head -n1)
 if [ -z "$SECRET_ARN" ]; then
   echo "Error: could not extract SECRET_ARN from the certificate step output." >&2
   echo "$CERT_OUTPUT" >&2

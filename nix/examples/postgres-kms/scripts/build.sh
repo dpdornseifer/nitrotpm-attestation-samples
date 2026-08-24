@@ -190,7 +190,7 @@ if [ "$AMI_RC" -ne 0 ]; then
   exit 1
 fi
 
-AMI_ID=$(printf '%s' "$AMI_OUTPUT" | grep -oP 'ami-[a-z0-9]+' | tail -n1)
+AMI_ID=$(printf '%s' "$AMI_OUTPUT" | grep -oE 'ami-[a-z0-9]+' | tail -n1)
 if [ -z "$AMI_ID" ]; then
   echo "Error: could not extract the AMI ID from the build output." >&2
   echo "$AMI_OUTPUT" >&2

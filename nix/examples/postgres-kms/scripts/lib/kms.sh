@@ -202,15 +202,24 @@ kms_policy_faults() {
     --arg role "$instance_role" --argjson pcrs "$pcr_condition" '
     def as_list: if type == "array" then . else [.] end;
     def actions: [.Action // [] | as_list | .[] | ascii_downcase];
+    # KMS expands wildcards, so prefix-match: kms:Decr* grants Decrypt but equals nothing.
+    def covers($want): actions | any(. as $a
+      | $a == "*" or $a == "kms:*" or $a == $want
+      or (($a | endswith("*")) and ($want | startswith($a[0:-1]))));
     def principals: [ if (.Principal | type) == "string" then .Principal
                       else (.Principal.AWS // empty) | as_list | .[] end ];
 
     [ .Statement[] | select(.Effect == "Allow") ] as $allow
-    # NotAction or kms:* still land here; count check below fails closed on unrecognised shapes.
-    | [ $allow[] | select(actions | any(. == "kms:decrypt" or . == "kms:*")) ] as $decrypt
+    # Inverted shapes populate no .Action/.Principal, so every check below reads them as empty
+    # and silently passes them. Fail closed instead: an Allow with NotAction can grant Decrypt.
+    | [ $allow[] | select(has("NotAction") or has("NotPrincipal") or has("NotResource")) ] as $unaudited
+    | [ $allow[] | select(covers("kms:decrypt")) ] as $decrypt
     | [ .Statement[] | select(.Effect == "Deny")
-        | select(actions | any(. == "kms:creategrant" or . == "kms:*")) ] as $deny
-    | [ if ($decrypt | length) != 1 then
+        | select(covers("kms:creategrant")) ] as $deny
+    | [ ( if ($unaudited | length) > 0 then
+            "Allow statement(s) use NotAction/NotPrincipal/NotResource and cannot be audited: \($unaudited | map(.Sid // "unnamed") | join(", "))"
+          else empty end ),
+        if ($decrypt | length) != 1 then
           "kms:Decrypt is granted by \($decrypt | length) Allow statement(s), expected exactly 1"
         else
           ( if ($decrypt[0] | principals) != [$role] then
@@ -220,8 +229,7 @@ kms_policy_faults() {
               "kms:Decrypt is not gated on exactly the PCR values just measured"
             else empty end )
         end,
-        ( if ([$allow[] | actions] | flatten
-              | any(. == "kms:putkeypolicy" or . == "kms:encrypt" or . == "kms:*")) then
+        ( if ([$allow[] | (covers("kms:putkeypolicy") or covers("kms:encrypt"))] | any) then
             "an Allow statement still grants kms:PutKeyPolicy, kms:Encrypt or kms:*"
           else empty end ),
         ( if ([$deny[] | principals] | flatten | any(. == "*")) then empty

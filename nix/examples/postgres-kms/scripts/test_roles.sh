@@ -31,7 +31,7 @@ assert_eq() {
 }
 
 # --- assume_role_exec: passthrough ------------------------------------------
-# Empty ARN uses ambient creds; stdout must be clean — callers parse it with grep -oP (see
+# Empty ARN uses ambient creds; stdout must be clean — callers parse it with sed (see
 # lib/roles.sh).
 
 OUT=$(assume_role_exec "" -- printf 'hello')
@@ -198,6 +198,21 @@ assert_policy_fault "policy: rejects a CreateGrant Deny narrowed to one principa
 assert_policy_fault "policy: rejects a wholly unrelated policy" \
   '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"kms:*","Resource":"*"}]}'
 
+# Inverted shapes and wildcards. An Allow carrying NotAction populates no .Action, so every check
+# above reads it as granting nothing while KMS reads it as granting everything not listed.
+assert_policy_fault "policy: rejects an Allow using NotAction" \
+  "$(printf '%s' "$INSTALLED_T" | jq -c '.Statement += [{Sid: "backdoor", Effect: "Allow", Principal: {AWS: "arn:aws:iam::999999999999:role/Attacker"}, NotAction: ["kms:Encrypt","kms:CreateGrant"], Resource: "*"}]')"
+assert_policy_fault "policy: rejects an Allow using NotPrincipal" \
+  "$(printf '%s' "$INSTALLED_T" | jq -c '.Statement += [{Sid: "backdoor", Effect: "Allow", NotPrincipal: {AWS: "arn:aws:iam::999999999999:role/Nobody"}, Action: ["kms:Decrypt"], Resource: "*"}]')"
+assert_policy_fault "policy: rejects an Allow using NotResource" \
+  "$(printf '%s' "$INSTALLED_T" | jq -c '.Statement += [{Sid: "backdoor", Effect: "Allow", Principal: {AWS: "arn:aws:iam::999999999999:role/Attacker"}, Action: ["kms:Decrypt"], NotResource: "arn:aws:kms:::key/nothing"}]')"
+assert_policy_fault "policy: rejects Decrypt granted via a kms:Decr* wildcard" \
+  "$(printf '%s' "$INSTALLED_T" | jq -c '.Statement += [{Sid: "wild", Effect: "Allow", Principal: {AWS: "arn:aws:iam::999999999999:role/Attacker"}, Action: ["kms:Decr*"], Resource: "*"}]')"
+assert_policy_fault "policy: rejects PutKeyPolicy granted via a kms:Put* wildcard" \
+  "$(printf '%s' "$INSTALLED_T" | jq -c '.Statement[0].Action += ["kms:Put*"]')"
+assert_policy_fault "policy: rejects an Allow of a bare \"*\" action" \
+  "$(printf '%s' "$INSTALLED_T" | jq -c '.Statement[0].Action = ["*"]')"
+
 # Source assertion: 02b must verify through the shared function, not a document diff.
 if grep -q 'kms_policy_faults' "$SCRIPT_DIR/steps/02b_finalize_kms_policy.sh"; then
   pass "source: 02b verifies the installed policy via kms_policy_faults"
@@ -246,6 +261,27 @@ case "$WARN" in
   *) fail "lock_secret_to_deployer must warn on stderr when no deployer ARN is given, got: $WARN" ;;
 esac
 
+# --- update_resource --------------------------------------------------------
+# Must fail loudly. A silent skip means the resource never reaches resources.json and clean.sh
+# cannot tear it down, so the run orphans live infrastructure while reporting success.
+UR_DIR=$(mktemp -d)
+RESOURCES_FILE="$UR_DIR/resources.json"
+
+echo '{}' > "$RESOURCES_FILE"
+update_resource "VOLUME_ID" "vol-123" >/dev/null 2>&1
+assert_eq "update_resource returns 0 on a good write" "0" "$?"
+assert_eq "update_resource actually persists the value" "vol-123" \
+  "$(jq -r '.VOLUME_ID' "$RESOURCES_FILE")"
+
+printf 'not json {{{' > "$RESOURCES_FILE"
+update_resource "VOLUME_ID" "vol-456" >/dev/null 2>&1
+assert_eq "update_resource returns non-zero when jq cannot parse the file" "1" "$?"
+assert_eq "update_resource leaves no temp file behind on failure" "1" \
+  "$(find "$UR_DIR" -type f | wc -l | tr -d ' ')"
+
+rm -rf "$UR_DIR"
+unset RESOURCES_FILE
+
 # --- role policies ----------------------------------------------------------
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=lib/role-policies.sh
@@ -255,7 +291,7 @@ ACCT="123456789012"
 OP=$(build_operator_policy "$ACCT" "TpmAttestationRole" "TpmAttestationProfile")
 CUST=$(build_custodian_policy)
 DEPL=$(build_deployer_policy "$ACCT")
-PROV=$(build_provisioner_policy)
+PROV=$(build_provisioner_policy "$ACCT")
 CLIENT=$(build_test_client_policy "$ACCT")
 
 grants() {
@@ -311,6 +347,19 @@ assert_eq "operator DeleteSecret covers only the two families clean.sh owns" "tr
      | select(([.Action] | flatten | index("secretsmanager:DeleteSecret")) != null)
      | .Resource] | flatten
      | all(test("postgres-kms/client-cert-\\*$|nitrotpm-sb-identity-\\*$"))')"
+
+# The Provisioner must not be able to create a secret that shadows the signing identity.
+assert_eq "provisioner secretsmanager:CreateSecret is resource-scoped" "false" \
+  "$(grants_on_star "$PROV" "secretsmanager:CreateSecret")"
+assert_eq "provisioner CreateSecret covers only the client-cert family" "true" \
+  "$(printf '%s' "$PROV" | jq '[.Statement[]
+     | select(([.Action] | flatten | index("secretsmanager:CreateSecret")) != null)
+     | .Resource] | flatten
+     | all(test("postgres-kms/client-cert-\\*$"))')"
+assert_eq "provisioner cannot create a secret in the signing-identity namespace" "true" \
+  "$(printf '%s' "$PROV" | jq '[.Statement[]
+     | select(([.Action] | flatten | index("secretsmanager:CreateSecret")) != null)
+     | .Resource] | flatten | any(test("nitrotpm-sb-identity")) | not')"
 # clean.sh:85 deletes AMI backing snapshots; the documented monolith omitted this.
 assert_eq "operator can delete AMI snapshots" "true" "$(grants "$OP" "ec2:DeleteSnapshot")"
 
@@ -378,6 +427,19 @@ if grep -q 'build_operator_policy' "$CREATE_ROLES" 2>/dev/null; then
   pass "source: 00_create_roles.sh uses the shared policy builders"
 else
   fail "source: 00_create_roles.sh must call build_operator_policy from lib/role-policies.sh"
+fi
+# A pre-positioned role keeps whatever it already trusts unless the trust policy is reconciled,
+# and refreshing one named policy leaves any other inline or attached document in place.
+if grep -q 'update-assume-role-policy' "$CREATE_ROLES" 2>/dev/null; then
+  pass "source: 00_create_roles.sh reconciles the trust policy on an existing role"
+else
+  fail "source: 00_create_roles.sh must call update-assume-role-policy for existing roles"
+fi
+if grep -q 'delete-role-policy' "$CREATE_ROLES" 2>/dev/null \
+   && grep -q 'detach-role-policy' "$CREATE_ROLES" 2>/dev/null; then
+  pass "source: 00_create_roles.sh drains unexpected inline and managed policies"
+else
+  fail "source: 00_create_roles.sh must drain policies it did not attach"
 fi
 # Inline PERMISSION documents only. The trust policy is a different artifact with no
 # shared builder, legitimately built via jq -n — do not convert it back to a heredoc.

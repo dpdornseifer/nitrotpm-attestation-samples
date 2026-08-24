@@ -3,7 +3,7 @@
 # Per-stage credential scoping. Empty role ARN is a passthrough: both the zero-config path
 # (no flags → run as caller) and the real-ceremony path (Custodian's shell already holds the
 # right creds).
-# All diagnostics go to stderr: eight call sites parse step-script stdout with grep -oP, so a
+# All diagnostics go to stderr: eight call sites parse step-script stdout with sed, so a
 # stray line breaks the parse.
 
 # Run a command under <role_arn>'s creds, or ambient creds when ARN is empty. Args: <role_arn>

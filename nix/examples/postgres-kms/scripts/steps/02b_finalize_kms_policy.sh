@@ -126,7 +126,7 @@ done
 if [ -n "$GRANTS" ]; then
   echo "Error: grant(s) present on $KEY_ARN after finalize: $GRANTS" >&2
   echo "       A grant bypasses the PCR-gated policy. Revoke and investigate:" >&2
-  echo "       aws kms revoke-grant --key-id $KEY_ARN --grant-id <id>" >&2
+  echo "       aws kms revoke-grant --region ${AWS_REGION:-${AWS_DEFAULT_REGION:-<REGION>}} --key-id $KEY_ARN --grant-id <id>" >&2
   exit 1
 fi
 

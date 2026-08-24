@@ -11,10 +11,12 @@ RESOURCES_FILE="$ARTIFACTS_DIR/resources.json"
 . "$SCRIPT_DIR/lib/roles.sh"
 
 CUSTODIAN_ROLE_ARN=""
+OPERATOR_ROLE_ARN=""
 DELETE_PROVISIONING_ROLES=false
 while [[ "$#" -gt 0 ]]; do
   case $1 in
     --custodian-role-arn) CUSTODIAN_ROLE_ARN="$2"; shift ;;
+    --operator-role-arn) OPERATOR_ROLE_ARN="$2"; shift ;;
     --delete-provisioning-roles) DELETE_PROVISIONING_ROLES=true ;;
     *) echo "Unknown option $1" >&2; exit 1 ;;
   esac
@@ -50,11 +52,16 @@ IDENTITY_ARN=$(jq -r '.IDENTITY_ARN // empty' "$RESOURCES_FILE")
 if [ -z "$CUSTODIAN_ROLE_ARN" ]; then
   CUSTODIAN_ROLE_ARN=$(jq -r '.CUSTODIAN_ROLE_ARN // empty' "$RESOURCES_FILE")
 fi
+if [ -z "$OPERATOR_ROLE_ARN" ]; then
+  OPERATOR_ROLE_ARN=$(jq -r '.OPERATOR_ROLE_ARN // empty' "$RESOURCES_FILE")
+fi
 
 CLEANUP_SUCCESS=true
 
+# Everything here was created through the Operator role, so tear it down with the same role;
+# an empty ARN falls through to ambient credentials. The Operator policy covers every call below.
 run_aws_command() {
-  if ! output=$(aws "$@" 2>&1); then
+  if ! output=$(assume_role_exec "$OPERATOR_ROLE_ARN" -- aws "$@" 2>&1); then
     echo "Error executing: aws $*"
     echo "Output: $output"
     CLEANUP_SUCCESS=false
@@ -62,10 +69,18 @@ run_aws_command() {
   fi
 }
 
+# Only a confirmed not-found is safe to swallow. Any other failure (AccessDenied, throttling,
+# DependencyViolation) means the resource may still be live, and leaving CLEANUP_SUCCESS=true
+# would delete resources.json — its only record.
 run_aws_command_optional() {
-  if ! output=$(aws "$@" 2>&1); then
-    echo "Warning: aws $*"
+  if ! output=$(assume_role_exec "$OPERATOR_ROLE_ARN" -- aws "$@" 2>&1); then
+    if printf '%s' "$output" | grep -qE 'NotFound|NoSuchEntity|does not exist'; then
+      echo "Already gone: aws $*"
+      return 0
+    fi
+    echo "Error executing: aws $*"
     echo "Output: $output"
+    CLEANUP_SUCCESS=false
     return 1
   fi
 }
@@ -93,7 +108,7 @@ fi
 
 if [ -n "$AMI_ID" ]; then
   # Snapshot IDs must be read before deregistering (describe-images fails after)
-  SNAPSHOT_IDS=$(aws ec2 describe-images --image-ids "$AMI_ID" \
+  SNAPSHOT_IDS=$(assume_role_exec "$OPERATOR_ROLE_ARN" -- aws ec2 describe-images --image-ids "$AMI_ID" \
     --query 'Images[0].BlockDeviceMappings[*].Ebs.SnapshotId' --output text 2>/dev/null || true)
 
   echo "Deregistering AMI: $AMI_ID"
@@ -123,7 +138,7 @@ if [ -n "$INSTANCE_PROFILE_NAME" ] && [ -n "$ROLE_NAME" ]; then
   run_aws_command iam delete-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME"
 
   echo "Detaching policies from IAM role: $ROLE_NAME"
-  if ATTACHED_POLICIES=$(aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query 'AttachedPolicies[*].PolicyArn' --output text 2>/dev/null); then
+  if ATTACHED_POLICIES=$(assume_role_exec "$OPERATOR_ROLE_ARN" -- aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query 'AttachedPolicies[*].PolicyArn' --output text 2>/dev/null); then
     for POLICY_ARN in $ATTACHED_POLICIES; do
       echo "Detaching policy: $POLICY_ARN"
       run_aws_command iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN"
@@ -134,7 +149,7 @@ if [ -n "$INSTANCE_PROFILE_NAME" ] && [ -n "$ROLE_NAME" ]; then
   fi
 
   echo "Deleting inline policies from IAM role: $ROLE_NAME"
-  if INLINE_POLICIES=$(aws iam list-role-policies --role-name "$ROLE_NAME" --query 'PolicyNames[]' --output text 2>/dev/null); then
+  if INLINE_POLICIES=$(assume_role_exec "$OPERATOR_ROLE_ARN" -- aws iam list-role-policies --role-name "$ROLE_NAME" --query 'PolicyNames[]' --output text 2>/dev/null); then
     for POLICY_NAME in $INLINE_POLICIES; do
       echo "Deleting inline policy: $POLICY_NAME"
       run_aws_command iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "$POLICY_NAME"
@@ -172,13 +187,17 @@ if [ "$DELETE_PROVISIONING_ROLES" = true ]; then
     PROV_ROLES="NitroTpmCustodianRole NitroTpmProvisionerRole NitroTpmDeployerRole
                 NitroTpmOperatorRole NitroTpmTestClientRole"
   fi
+  # Ambient credentials on purpose: these calls need the out-of-ceremony IAM permissions that
+  # created the roles, which the Operator deliberately lacks.
   for PROV_ROLE in $PROV_ROLES; do
     if aws iam get-role --role-name "$PROV_ROLE" >/dev/null 2>&1; then
       for POLICY_NAME in $(aws iam list-role-policies --role-name "$PROV_ROLE" --query 'PolicyNames[]' --output text 2>/dev/null); do
-        run_aws_command_optional iam delete-role-policy --role-name "$PROV_ROLE" --policy-name "$POLICY_NAME"
+        aws iam delete-role-policy --role-name "$PROV_ROLE" --policy-name "$POLICY_NAME" >/dev/null 2>&1 \
+          || { echo "Error deleting inline policy $POLICY_NAME from $PROV_ROLE"; CLEANUP_SUCCESS=false; }
       done
       echo "Deleting provisioning role: $PROV_ROLE"
-      run_aws_command_optional iam delete-role --role-name "$PROV_ROLE"
+      aws iam delete-role --role-name "$PROV_ROLE" >/dev/null 2>&1 \
+        || { echo "Error deleting provisioning role $PROV_ROLE"; CLEANUP_SUCCESS=false; }
     fi
   done
 fi

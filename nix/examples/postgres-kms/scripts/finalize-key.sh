@@ -48,7 +48,8 @@ done
 # Fail closed: a PCR-less policy looks like success while gating on nothing.
 for REQUIRED in KEY_ID INSTANCE_ROLE_ARN PCR_DIR; do
   if [ -z "${!REQUIRED}" ]; then
-    echo "Error: --${REQUIRED//_/-} is required." >&2
+    # tr, not ${x,,}: that needs bash 4 and macOS ships 3.2.
+    echo "Error: --$(printf '%s' "$REQUIRED" | tr 'A-Z_' 'a-z-') is required." >&2
     usage
   fi
 done
