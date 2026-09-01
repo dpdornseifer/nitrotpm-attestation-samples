@@ -65,6 +65,9 @@
               KERNEL=="tpm0", OWNER="root", GROUP="tpm", MODE="0660"
             '';
 
+            # Symlinks NVMe EBS disks to their attach-time BDM name (/dev/xvdf); see luks-init.nix.
+            services.udev.packages = [ pkgs.amazon-ec2-utils ];
+
             systemd.services.kms-init = {
               description = "Initialize KMS and decrypt symmetric key";
               wantedBy = [ "multi-user.target" ];

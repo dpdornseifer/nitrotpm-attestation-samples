@@ -99,18 +99,22 @@ CA_CERT_B64=$(base64 -w 0 "$CERT_TMPDIR/ca.crt")
 CLIENT_CERT_B64=$(base64 -w 0 "$CERT_TMPDIR/client.crt")
 CLIENT_KEY_B64=$(base64 -w 0 "$CERT_TMPDIR/client.key")
 
-CLIENT_BUNDLE_JSON=$(jq -n \
+# Via a file, not argv: --secret-string on the command line leaks the client key through
+# /proc/<pid>/cmdline. CERT_TMPDIR is 0700, trap-removed, and already holds client.key.
+CLIENT_BUNDLE_FILE="$CERT_TMPDIR/client_bundle.json"
+jq -n \
   --arg ca_cert "$CA_CERT_B64" \
   --arg client_cert "$CLIENT_CERT_B64" \
   --arg client_key "$CLIENT_KEY_B64" \
-  '{ca_cert: $ca_cert, client_cert: $client_cert, client_key: $client_key}')
+  '{ca_cert: $ca_cert, client_cert: $client_cert, client_key: $client_key}' \
+  > "$CLIENT_BUNDLE_FILE"
 
 UNIQUE_SUFFIX=$(date +%s)-$(openssl rand -hex 4)
 SECRET_NAME="postgres-kms/client-cert-${UNIQUE_SUFFIX}"
 
 SECRET_ARN=$(aws secretsmanager create-secret \
   --name "$SECRET_NAME" \
-  --secret-string "$CLIENT_BUNDLE_JSON" \
+  --secret-string "file://$CLIENT_BUNDLE_FILE" \
   --query 'ARN' \
   --output text)
 echo "Client certificate bundle stored in Secrets Manager: $SECRET_ARN"

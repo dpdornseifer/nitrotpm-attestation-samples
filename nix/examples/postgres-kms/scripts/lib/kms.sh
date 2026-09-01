@@ -190,10 +190,9 @@ build_final_policy() {
 
 # Check security properties of the live policy. Diffing the stored document doesn't work: KMS
 # re-serializes it (whitespace, "*" → {"AWS":"*"}), so normalization is indistinguishable from
-# a racing
-# PutKeyPolicy. Checks: only instance role may Decrypt under exactly these PCRs; CreateGrant
-# Denied to all;
-# no Allow on ratcheted actions. Prints one line per fault; empty = policy is ours.
+# a racing PutKeyPolicy. Checks: only the instance role may Decrypt, under exactly these PCRs;
+# CreateGrant Denied to all; no Allow of any action outside the final policy's set.
+# Prints one line per fault; empty = policy is ours.
 # Args: <policy-json> <instance-role-arn> <pcr-condition-object>.
 kms_policy_faults() {
   local policy="$1" instance_role="$2" pcr_condition="$3"
@@ -209,7 +208,10 @@ kms_policy_faults() {
     def principals: [ if (.Principal | type) == "string" then .Principal
                       else (.Principal.AWS // empty) | as_list | .[] end ];
 
-    [ .Statement[] | select(.Effect == "Allow") ] as $allow
+    # Lowercased; keep in step with build_final_policy.
+    [ "kms:decrypt", "kms:schedulekeydeletion", "kms:listgrants", "kms:revokegrant",
+      "kms:getkeypolicy" ] as $permitted
+    | [ .Statement[] | select(.Effect == "Allow") ] as $allow
     # Inverted shapes populate no .Action/.Principal, so every check below reads them as empty
     # and silently passes them. Fail closed instead: an Allow with NotAction can grant Decrypt.
     | [ $allow[] | select(has("NotAction") or has("NotPrincipal") or has("NotResource")) ] as $unaudited
@@ -229,9 +231,12 @@ kms_policy_faults() {
               "kms:Decrypt is not gated on exactly the PCR values just measured"
             else empty end )
         end,
-        ( if ([$allow[] | (covers("kms:putkeypolicy") or covers("kms:encrypt"))] | any) then
-            "an Allow statement still grants kms:PutKeyPolicy, kms:Encrypt or kms:*"
-          else empty end ),
+        # Allowlist, not denylist: ReEncryptFrom is Decrypt-equivalent without being named
+        # Decrypt, and a denylist misses whatever KMS ships next. Exact match, so wildcards fault.
+        ( ( [ $allow[] | actions[] ] - $permitted ) as $extra
+          | if ($extra | length) > 0 then
+              "Allow statement(s) grant action(s) outside the final policy: \($extra | unique | join(", "))"
+            else empty end ),
         ( if ([$deny[] | principals] | flatten | any(. == "*")) then empty
           else "kms:CreateGrant is not denied to all principals" end )
       ] | .[]'

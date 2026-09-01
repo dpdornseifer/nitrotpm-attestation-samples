@@ -19,20 +19,20 @@ pkgs.writeScript "luks-init.sh" ''
   KEY=$(cat /run/kms-init/symmetric_key)
 
   # EBS is hot-attached after "running"; poll until the device appears.
+  # /dev/xvdf is the attach-volume BDM name, symlinked by the amazon-ec2-utils udev rules.
+  # Never fall back to /dev/nvme1n1: NVMe indices follow enumeration order, so the guess can
+  # land on the root disk and luksFormat below destroys it. No symlink = time out, fail closed.
   DATA_DEV=""
   for _ in $(${pkgs.coreutils}/bin/seq 60); do
-    if [ -e /dev/xvdf ]; then
+    if [ -b /dev/xvdf ]; then
       DATA_DEV=/dev/xvdf
-      break
-    elif [ -e /dev/nvme1n1 ]; then
-      DATA_DEV=/dev/nvme1n1
       break
     fi
     echo "Waiting for data device to be attached..."
     ${pkgs.coreutils}/bin/sleep 2
   done
   if [ -z "$DATA_DEV" ]; then
-    echo "Error: No data device found at /dev/xvdf or /dev/nvme1n1 after 120s"
+    echo "Error: no /dev/xvdf block device after 120s; refusing to guess an NVMe index"
     exit 1
   fi
   echo "Using data device: $DATA_DEV"

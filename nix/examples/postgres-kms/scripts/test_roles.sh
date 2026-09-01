@@ -210,6 +210,17 @@ assert_policy_fault "policy: rejects Decrypt granted via a kms:Decr* wildcard" \
   "$(printf '%s' "$INSTALLED_T" | jq -c '.Statement += [{Sid: "wild", Effect: "Allow", Principal: {AWS: "arn:aws:iam::999999999999:role/Attacker"}, Action: ["kms:Decr*"], Resource: "*"}]')"
 assert_policy_fault "policy: rejects PutKeyPolicy granted via a kms:Put* wildcard" \
   "$(printf '%s' "$INSTALLED_T" | jq -c '.Statement[0].Action += ["kms:Put*"]')"
+# Decrypt-equivalent without being named Decrypt: ReEncryptFrom here + ReEncryptTo on the
+# caller's own key exfiltrates the DEK ungated. A loop, to pin the class and not one action.
+for EXTRA_T in kms:ReEncryptFrom kms:ReEncryptTo kms:ReEncrypt kms:ReplicateKey \
+               kms:GenerateDataKey kms:GenerateDataKeyWithoutPlaintext kms:CreateAlias; do
+  assert_policy_fault "policy: rejects an added Allow of $EXTRA_T" \
+    "$(printf '%s' "$INSTALLED_T" | jq -c --arg a "$EXTRA_T" \
+      '.Statement += [{Sid: "widen", Effect: "Allow",
+                       Principal: {AWS: "arn:aws:iam::999999999999:role/Attacker"},
+                       Action: [$a], Resource: "*"}]')"
+done
+
 assert_policy_fault "policy: rejects an Allow of a bare \"*\" action" \
   "$(printf '%s' "$INSTALLED_T" | jq -c '.Statement[0].Action = ["*"]')"
 
@@ -224,6 +235,15 @@ if grep -qE 'diff <\(jq -S \. "\$KEY_POLICY_FILE"\)' "$SCRIPT_DIR/steps/02b_fina
 else
   pass "source: 02b no longer diffs the policy document"
 fi
+
+# Source assertion: --secret-string needs file://; a bare "$VAR" leaks the key via /proc/cmdline.
+for SECRET_SITE_T in "$SCRIPT_DIR/steps/05a_create_certificates.sh" "$SCRIPT_DIR/lib/identity.sh"; do
+  if grep -q -- '--secret-string "\$' "$SECRET_SITE_T"; then
+    fail "source: $(basename "$SECRET_SITE_T") passes secret material on argv; use --secret-string \"file://...\""
+  else
+    pass "source: $(basename "$SECRET_SITE_T") gives create-secret its secret by file reference"
+  fi
+done
 
 # --- build_identity_resource_policy -----------------------------------------
 # shellcheck source-path=SCRIPTDIR
